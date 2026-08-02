@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Lightweight TUI client for Subsonic servers (Navidrome, Airsonic, ...)"
 license = "MIT"
-repository = "https://github.com/TripShuti/selfsonic"
+repository = "https://github.com/TripShuti/SELFsonic"
 keywords = ["subsonic", "navidrome", "tui", "music", "player"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
