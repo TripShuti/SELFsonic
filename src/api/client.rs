@@ -133,6 +133,24 @@ impl Client {
         Ok(payload.album_list_2.album)
     }
 
+    /// Повний обхід каталогу альбомів сторінками (по 500), щоб мати
+    /// повний список для прунінгу. Зупиняється на короткій сторінці.
+    pub fn get_all_albums(&self) -> Result<Vec<AlbumId3>> {
+        const PAGE_SIZE: i32 = 500;
+        const MAX_PAGES: i32 = 500;
+        let mut albums = Vec::new();
+        let mut page = 0;
+        loop {
+            let slice = self.get_album_list2(page * PAGE_SIZE, PAGE_SIZE)?;
+            albums.extend(slice);
+            page += 1;
+            if albums.len() < page as usize * PAGE_SIZE as usize || page >= MAX_PAGES {
+                break;
+            }
+        }
+        Ok(albums)
+    }
+
     pub fn get_artist(&self, id: &str) -> Result<ArtistWithAlbums> {
         let payload: ArtistPayload = self.call("getArtist", &[("id", id.to_string())])?;
         Ok(payload.artist)

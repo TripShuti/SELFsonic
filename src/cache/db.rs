@@ -212,6 +212,42 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Видаляє альбоми, яких більше немає на сервері
+    /// (тільки після повного обходу get_all_albums).
+    pub fn prune_albums(&mut self, keep_ids: &[String]) -> Result<()> {
+        if keep_ids.is_empty() {
+            return self
+                .conn
+                .execute("DELETE FROM albums", [])
+                .map(|_| ())
+                .map_err(Into::into);
+        }
+        let placeholders = vec!["?"; keep_ids.len()].join(",");
+        self.conn
+            .execute(
+                &format!("DELETE FROM albums WHERE id NOT IN ({placeholders})"),
+                rusqlite::params_from_iter(keep_ids.iter()),
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Видаляє треки, чий контейнер (альбом або плейлист) більше не існує
+    /// в кеші. Викликати після prune_albums + prune_playlists.
+    pub fn prune_orphan_tracks(&mut self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM tracks
+                 WHERE (album_id LIKE 'playlist:%'
+                        AND substr(album_id, 10) NOT IN (SELECT id FROM playlists))
+                    OR (album_id NOT LIKE 'playlist:%'
+                        AND album_id NOT IN (SELECT id FROM albums))",
+                [],
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     pub fn recent_albums(&self, limit: i32) -> Result<Vec<CachedAlbum>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, artist, duration, year
@@ -520,6 +556,85 @@ mod tests {
         let list = db.artists().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "a1");
+    }
+
+    #[test]
+    fn prune_albums_removes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        let artist = ArtistWithAlbums {
+            id: "a1".into(),
+            name: "Artist".into(),
+            album_count: Some(2),
+            album: vec![album("al1", "Album One"), album("al2", "Album Two")],
+        };
+        db.upsert_artist_albums(&artist).unwrap();
+
+        db.prune_albums(&["al1".to_string()]).unwrap();
+
+        let albums = db.albums_by_artist("a1").unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, "al1");
+    }
+
+    #[test]
+    fn prune_orphan_tracks_removes_dead_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        let t = |id: &str| Child {
+            id: id.into(),
+            title: Some(id.into()),
+            album: Some("A".into()),
+            artist: Some("X".into()),
+            duration: Some(240),
+            track: Some(1),
+            ..Default::default()
+        };
+
+        // Живі контейнери: альбом al1, плейлист p1.
+        db.upsert_artist_albums(&ArtistWithAlbums {
+            id: "a1".into(),
+            name: "Artist".into(),
+            album_count: Some(1),
+            album: vec![album("al1", "Album One")],
+        })
+        .unwrap();
+        db.upsert_album_tracks("al1", &[t("t1")]).unwrap();
+        db.upsert_playlist_tracks(&PlaylistWithSongs {
+            id: "p1".into(),
+            name: "P1".into(),
+            song_count: Some(1),
+            duration: Some(240),
+            entry: vec![t("t2")],
+        })
+        .unwrap();
+        // Мертві контейнери: альбом al2, плейлист p2.
+        db.upsert_album_tracks("al2", &[t("t3")]).unwrap();
+        db.upsert_playlist_tracks(&PlaylistWithSongs {
+            id: "p2".into(),
+            name: "P2".into(),
+            song_count: Some(1),
+            duration: Some(240),
+            entry: vec![t("t4")],
+        })
+        .unwrap();
+
+        // Refresh-послідовність: upsert свіжих + прунінг мертвих.
+        db.upsert_albums(&[album("al1", "Album One")]).unwrap();
+        db.upsert_playlists(&[playlist("p1", "P1")]).unwrap();
+        db.prune_albums(&["al1".to_string()]).unwrap();
+        db.prune_playlists(&["p1".to_string()]).unwrap();
+        db.prune_orphan_tracks().unwrap();
+
+        assert_eq!(db.tracks_by_album("al1").unwrap().len(), 1);
+        assert!(db.tracks_by_album("al2").unwrap().is_empty());
+        assert_eq!(db.playlist_tracks("p1").unwrap().len(), 1);
+        assert!(db.playlist_tracks("p2").unwrap().is_empty());
+        let all = db.tracks_by_ids(&["t1".into(), "t2".into(), "t3".into(), "t4".into()]).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|t| t.id == "t1" || t.id == "t2"));
     }
 
     #[test]

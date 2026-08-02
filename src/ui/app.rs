@@ -197,12 +197,15 @@ impl AppState {
             db.upsert_artists(&artists)?;
             let artist_ids: Vec<String> = artists.iter().map(|a| a.id.clone()).collect();
             db.prune_artists(&artist_ids)?;
-            let albums = client.get_album_list2(0, 500)?;
+            let albums = client.get_all_albums()?;
             db.upsert_albums(&albums)?;
+            let album_ids: Vec<String> = albums.iter().map(|a| a.id.clone()).collect();
+            db.prune_albums(&album_ids)?;
             let playlists = client.get_playlists()?;
             db.upsert_playlists(&playlists)?;
             let playlist_ids: Vec<String> = playlists.iter().map(|p| p.id.clone()).collect();
             db.prune_playlists(&playlist_ids)?;
+            db.prune_orphan_tracks()?;
             Ok(())
         })();
         self.loading = false;
