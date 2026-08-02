@@ -47,6 +47,10 @@ impl Client {
         let stream_cfg = ureq::config::Config::builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(10)))
+            // Без пулу: кожен стрім — свіже TCP-з'єднання.
+            // Мертві idle-конекшни після сну системи неможливі.
+            .max_idle_connections(0)
+            .max_idle_connections_per_host(0)
             .build();
         Ok(Self {
             api_agent: ureq::Agent::new_with_config(api_cfg),
@@ -194,9 +198,38 @@ impl Client {
             .name("selfsonic-stream".into())
             .spawn(move || {
                 let res = (|| -> std::result::Result<(), AppError> {
-                    let resp = agent.get(&url).call().map_err(|e| {
-                        AppError::Network(format!("stream {track_id}: {e}"))
-                    })?;
+                    // Retry на транспортні помилки і 5xx (як у call()).
+                    let mut attempt = 0;
+                    let resp = loop {
+                        match agent.get(&url).call() {
+                            Ok(resp) => {
+                                let status = resp.status().as_u16();
+                                if status < 500 {
+                                    break resp;
+                                }
+                                if attempt >= MAX_RETRIES {
+                                    return Err(AppError::Network(format!(
+                                        "stream {track_id}: server responded {status} after {MAX_RETRIES} attempts"
+                                    )));
+                                }
+                                attempt += 1;
+                                let delay = BACKOFF_BASE_MS * (1 << (attempt - 1));
+                                debug!("stream {track_id} 5xx ({status}), retry {attempt} in {delay}ms");
+                                thread::sleep(Duration::from_millis(delay));
+                            }
+                            Err(e) => {
+                                if attempt >= MAX_RETRIES {
+                                    return Err(AppError::Network(format!(
+                                        "stream {track_id}: {e}"
+                                    )));
+                                }
+                                attempt += 1;
+                                let delay = BACKOFF_BASE_MS * (1 << (attempt - 1));
+                                debug!("stream {track_id} error: {e}, retry {attempt}");
+                                thread::sleep(Duration::from_millis(delay));
+                            }
+                        }
+                    };
                     if resp.status().as_u16() >= 400 {
                         return Err(AppError::Network(format!(
                             "stream {track_id}: HTTP {}",
