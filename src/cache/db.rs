@@ -133,6 +133,22 @@ impl Db {
         Ok(())
     }
 
+    /// Видаляє артистів, яких більше немає на сервері
+    /// (getArtists повертає повний список — прунінг безпечний).
+    pub fn prune_artists(&mut self, keep_ids: &[String]) -> Result<()> {
+        if keep_ids.is_empty() {
+            return self.conn.execute("DELETE FROM artists", []).map(|_| ()).map_err(Into::into);
+        }
+        let placeholders = vec!["?"; keep_ids.len()].join(",");
+        self.conn
+            .execute(
+                &format!("DELETE FROM artists WHERE id NOT IN ({placeholders})"),
+                rusqlite::params_from_iter(keep_ids.iter()),
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     pub fn artists(&self) -> Result<Vec<ArtistId3>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, album_count FROM artists ORDER BY name COLLATE NOCASE",
@@ -310,6 +326,31 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Видаляє плейлисти, яких більше немає на сервері, разом з їхніми
+    /// записами у playlist_tracks (getPlaylists повертає повний список —
+    /// прунінг безпечний).
+    pub fn prune_playlists(&mut self, keep_ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        if keep_ids.is_empty() {
+            tx.execute("DELETE FROM playlist_tracks", [])?;
+            tx.execute("DELETE FROM playlists", [])?;
+        } else {
+            let placeholders = vec!["?"; keep_ids.len()].join(",");
+            tx.execute(
+                &format!(
+                    "DELETE FROM playlist_tracks WHERE playlist_id NOT IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(keep_ids.iter()),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM playlists WHERE id NOT IN ({placeholders})"),
+                rusqlite::params_from_iter(keep_ids.iter()),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Зберігає треки плейлиста (за ід плейлиста) як альбомну групу.
     pub fn upsert_playlist_tracks(&mut self, playlist: &PlaylistWithSongs) -> Result<()> {
         let tx = self.conn.transaction()?;
@@ -398,7 +439,7 @@ fn map_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedTrack> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::AlbumId3;
+    use crate::api::models::{AlbumId3, ArtistId3, Playlist, PlaylistWithSongs};
 
     fn album(id: &str, name: &str) -> AlbumId3 {
         AlbumId3 {
@@ -411,6 +452,74 @@ mod tests {
             duration: Some(300),
             year: Some(2020),
         }
+    }
+
+    fn playlist(id: &str, name: &str) -> Playlist {
+        Playlist {
+            id: id.into(),
+            name: name.into(),
+            song_count: Some(3),
+            duration: Some(600),
+        }
+    }
+
+    #[test]
+    fn prune_playlists_removes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        db.upsert_playlists(&[playlist("p1", "Keep"), playlist("p2", "Gone")])
+            .unwrap();
+        let tracks = vec![Child {
+            id: "t1".into(),
+            title: Some("Track One".into()),
+            album: Some("Album".into()),
+            artist: Some("Artist".into()),
+            duration: Some(240),
+            track: Some(1),
+            ..Default::default()
+        }];
+        db.upsert_playlist_tracks(&PlaylistWithSongs {
+            id: "p2".into(),
+            name: "Gone".into(),
+            song_count: Some(1),
+            duration: Some(240),
+            entry: tracks.clone(),
+        })
+        .unwrap();
+
+        db.prune_playlists(&["p1".to_string()]).unwrap();
+
+        let list = db.playlists().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "p1");
+        assert!(db.playlist_tracks("p2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_artists_removes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        db.upsert_artists(&[
+            ArtistId3 {
+                id: "a1".into(),
+                name: "Keep".into(),
+                album_count: Some(1),
+            },
+            ArtistId3 {
+                id: "a2".into(),
+                name: "Gone".into(),
+                album_count: Some(1),
+            },
+        ])
+        .unwrap();
+
+        db.prune_artists(&["a1".to_string()]).unwrap();
+
+        let list = db.artists().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "a1");
     }
 
     #[test]

@@ -195,10 +195,14 @@ impl AppState {
         let result = (|| -> Result<()> {
             let artists = client.get_artists()?;
             db.upsert_artists(&artists)?;
+            let artist_ids: Vec<String> = artists.iter().map(|a| a.id.clone()).collect();
+            db.prune_artists(&artist_ids)?;
             let albums = client.get_album_list2(0, 500)?;
             db.upsert_albums(&albums)?;
             let playlists = client.get_playlists()?;
             db.upsert_playlists(&playlists)?;
+            let playlist_ids: Vec<String> = playlists.iter().map(|p| p.id.clone()).collect();
+            db.prune_playlists(&playlist_ids)?;
             Ok(())
         })();
         self.loading = false;
