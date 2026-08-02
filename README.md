@@ -69,7 +69,6 @@ Bus name: `org.mpris.MediaPlayer2.SELFsonic`. Exposes:
 - `org.mpris.MediaPlayer2.Player`
 - `org.mpris.MediaPlayer2.TrackList` (queue as a playlist, with `TrackListReplaced` signals)
 
-`tracklist.py` (repo root) is a small D-Bus wrapper for the TrackList interface, useful from quickshell / shell scripts:
 
 ```sh
 python3 tracklist.py --player SELFsonic list                # track ids
