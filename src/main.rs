@@ -1,0 +1,513 @@
+//! SELFsonic: легкий TUI-клієнт Subsonic на Rust.
+//!
+//! entrypoint, event loop, зв'язка всіх модулів.
+
+mod api;
+mod cache;
+mod config;
+mod error;
+mod playback;
+mod ui;
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use crossterm::event::{self, Event, KeyEvent};
+use mpris_server::{PlaybackStatus, Time, TrackId};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::Tabs;
+use ratatui::Frame;
+use tracing::{debug, info, warn};
+
+use crate::api::client::Client;
+use crate::cache::db::Db;
+use crate::config::{Config, cache_dir, state_dir};
+use crate::error::AppError;
+use crate::playback::engine::{Engine, EngineEvent, EngineState, LoopMode, TrackMeta};
+use crate::playback::mpris::{self, Mpris, MprisUpdate, PlayerCommand};
+use crate::ui::app::{AppState, Tab};
+use crate::ui::keybindings::Action;
+
+const TICK: Duration = Duration::from_millis(50);
+const POSITION_PUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn main() -> Result<()> {
+    let config_path = parse_args()?;
+    setup_logging()?;
+
+    let config = Config::load(&config_path)?;
+    info!("start, config: {}", config_path.display());
+
+    let _lock = SingleInstance::acquire()?;
+
+    let cache_dir = cache_dir()?;
+    let db_path = cache_dir.join("library.db");
+    let state_path = state_dir()?.join("state.json");
+
+    let mut db = Db::open(&db_path).context("opening cache database")?;
+    let client = Arc::new(
+        Client::new(&config.server.url, &config.server.username, &config.server.password)
+            .context("creating client")?,
+    );
+
+    let mut engine = Engine::new(client.clone(), config.audio.volume)
+        .map_err(|e| anyhow!("audio unavailable: {e}"))?;
+
+    let mut mpris = match Mpris::spawn() {
+        Ok(m) => {
+            info!("MPRIS enabled");
+            Some(m)
+        }
+        Err(e) => {
+            warn!("MPRIS disabled: {e}");
+            None
+        }
+    };
+
+    // Відновлення стану (черга/позиція/гучність).
+    if let Ok(EngineState { queue, queue_pos, .. }) = load_state_json(&state_path) {
+        match db.tracks_by_ids(&queue) {
+            Ok(tracks) if !tracks.is_empty() => {
+                let metas: Vec<TrackMeta> = tracks.iter().map(TrackMeta::from).collect();
+                let restored = EngineState {
+                    volume: engine.volume(),
+                    shuffle: engine.shuffle(),
+                    loop_mode: engine.loop_mode(),
+                    queue: queue.clone(),
+                    queue_pos,
+                };
+                engine.restore_state(&restored, metas);
+                debug!("restored queue with {} tracks", queue.len());
+            }
+            _ => {}
+        }
+    }
+
+    let mut app = AppState::new();
+    if let Err(e) = app.load_current_tab_from_cache(&mut db) {
+        warn!("cache empty/corrupted: {e}");
+    }
+    if db.artists().map(|a| a.is_empty()).unwrap_or(true) {
+        warn!("library empty, first refresh");
+        if let Err(e) = app.refresh(&client, &mut db) {
+            warn!("initial refresh failed: {e}");
+        }
+    }
+
+    let mut last_queue_gen = None;
+    refresh_mpris(mpris.as_ref(), &engine, &client, &mut last_queue_gen);
+
+    let res = run_tui(
+        &mut app,
+        &mut db,
+        &client,
+        &mut engine,
+        &mut mpris,
+        &mut last_queue_gen,
+    );
+
+    engine.save_state(&state_path);
+    if let Some(m) = mpris.as_mut() {
+        m.shutdown();
+    }
+    res
+}
+
+// ---------- аргументи / логування / single instance ----------
+
+fn parse_args() -> Result<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    let mut config_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                config_path = Some(args.next().ok_or_else(|| anyhow!("--config requires a path"))?);
+            }
+            "--help" | "-h" => {
+                println!("SELFsonic — Subsonic TUI client");
+                println!("  --config <path>  path to config.toml");
+                std::process::exit(0);
+            }
+            other => return Err(anyhow!("unknown argument: {other}")),
+        }
+    }
+    match config_path {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => Config::default_path().map_err(|e| anyhow!("{e}")),
+    }
+}
+
+fn setup_logging() -> Result<()> {
+    let dir = state_dir()?;
+    let file_appender = tracing_appender::rolling::never(&dir, "SELFsonic.log");
+    tracing_subscriber::fmt()
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+    Ok(())
+}
+
+/// Lock-файл single instance (AGENT.md). Знімається автоматично при drop.
+struct SingleInstance {
+    path: PathBuf,
+}
+
+impl SingleInstance {
+    fn acquire() -> Result<Self> {
+        let path = state_dir()?.join("lock");
+        let pid = std::process::id();
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{pid}");
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let other_pid = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    let alive = other_pid.is_some_and(pid_alive);
+                    if !alive {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if attempt == 0 {
+                        warn!("another instance is already running (pid={:?})", other_pid);
+                    }
+                    bail!("SELFsonic is already running (pid={})", other_pid.unwrap_or(0));
+                }
+                Err(e) => return Err(AppError::io(&path, e).into()),
+            }
+        }
+        bail!("failed to create lock file {}", path.display())
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+// ---------- TUI event loop ----------
+
+fn run_tui(
+    app: &mut AppState,
+    db: &mut Db,
+    client: &Arc<Client>,
+    engine: &mut Engine,
+    mpris: &mut Option<Mpris>,
+    last_queue_gen: &mut Option<usize>,
+) -> Result<()> {
+    let mut terminal = ratatui::init();
+    let mut quit = false;
+    let mut last_position = Instant::now();
+
+    let result: Result<()> = (|| {
+        while !quit {
+            terminal
+                .draw(|f| draw(f, app, engine))
+                .context("drawing")?;
+
+            if event::poll(TICK).context("event::poll")? {
+                match event::read().context("event::read")? {
+                    Event::Key(key) => {
+                        if !handle_key(app, db, client, engine, key) {
+                            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen);
+                        } else {
+                            quit = true;
+                        }
+                    }
+                    Event::Resize(..) => { /* перемалювання наступним tick */ }
+                    _ => {}
+                }
+            }
+
+            drain_mpris_commands(mpris.as_ref(), engine, app, &mut quit);
+            for ev in engine.poll_events() {
+                handle_engine_event(app, ev);
+            }
+            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen);
+
+            // Періодичне оновлення позиції в MPRIS.
+            if last_position.elapsed() >= POSITION_PUSH_INTERVAL {
+                last_position = Instant::now();
+                if let Some(m) = mpris.as_ref()
+                    && engine.current().is_some()
+                {
+                    m.update(MprisUpdate::Position(Time::from_secs(
+                        engine.position().as_secs() as i64,
+                    )));
+                }
+            }
+
+            // Авто-підвантаження наступної сторінки альбомів.
+            if app.tab == Tab::Albums
+                && !app.loading
+                && matches!(app.selected_item(), Some(ui::app::ListItem::More))
+            {
+                app.loading = true;
+                if let Err(e) = app.load_more_albums(client, db) {
+                    app.set_message(format!("Pagination: {e}"), true);
+                }
+                app.loading = false;
+            }
+        }
+        Ok(())
+    })();
+
+    ratatui::restore();
+    result
+}
+
+fn handle_key(
+    app: &mut AppState,
+    db: &mut Db,
+    client: &Arc<Client>,
+    engine: &mut Engine,
+    key: KeyEvent,
+) -> bool {
+    let Some(action) = Action::from_key(key) else {
+        return false;
+    };
+
+    if action == Action::Quit {
+        return true;
+    }
+
+    match action {
+        Action::Quit => {}
+        Action::Down => app.move_down(),
+        Action::Up => app.move_up(),
+        Action::PageDown => app.page(20, true),
+        Action::PageUp => app.page(20, false),
+        Action::Top => app.top(),
+        Action::Bottom => app.bottom(),
+        Action::NextTab => {
+            app.activate_tab(app.tab.next(), db);
+        }
+        Action::PrevTab => {
+            app.activate_tab(app.tab.prev(), db);
+        }
+        Action::Back => {
+            if app.has_parent() {
+                app.back();
+            }
+        }
+        Action::Select => {
+            if let Err(e) = app.select_current(client, db, engine) {
+                app.set_message(format!("{e}"), true);
+                warn!("select: {e}");
+            }
+        }
+        Action::PlayPause => engine.toggle(),
+        Action::Next => engine.next(),
+        Action::Previous => engine.previous(),
+        Action::CycleLoop => {
+            engine.cycle_loop();
+        }
+        Action::ToggleShuffle => {
+            engine.toggle_shuffle();
+        }
+        Action::VolumeUp => engine.set_volume(engine.volume() + 0.05),
+        Action::VolumeDown => engine.set_volume(engine.volume() - 0.05),
+        Action::SeekForward => engine.seek_relative(10),
+        Action::SeekBackward => engine.seek_relative(-10),
+        Action::Refresh => {
+            if let Err(e) = app.refresh(client, db) {
+                warn!("refresh: {e}");
+            }
+        }
+    }
+    false
+}
+
+// ---------- MPRIS: команди та оновлення ----------
+
+fn drain_mpris_commands(
+    mpris: Option<&Mpris>,
+    engine: &mut Engine,
+    app: &mut AppState,
+    quit: &mut bool,
+) {
+    let Some(mpris) = mpris else { return };
+    while let Ok(cmd) = mpris.commands().try_recv() {
+        match cmd {
+            PlayerCommand::Play | PlayerCommand::PlayPause => engine.toggle(),
+            PlayerCommand::Pause => {
+                if !engine.paused() && !engine.stopped() {
+                    engine.toggle();
+                }
+            }
+            PlayerCommand::Next => engine.next(),
+            PlayerCommand::Previous => engine.previous(),
+            PlayerCommand::Stop => engine.stop(),
+            PlayerCommand::Seek { offset_us } => {
+                engine.seek_relative(offset_us / 1_000_000);
+            }
+            PlayerCommand::SetPosition { track_id, position_us } => {
+                if let Ok(tid) = TrackId::try_from(track_id)
+                    && let Some(id) = mpris::track_id_to_subsonic(&tid)
+                    && engine.current().is_some_and(|t| t.id == id)
+                {
+                    engine.seek_to(Duration::from_micros(position_us as u64));
+                }
+            }
+            PlayerCommand::OpenUri(uri) => {
+                warn!("OpenUri is not supported: {uri}");
+            }
+            PlayerCommand::SetLoopStatus(status) => {
+                engine.set_loop_mode(mpris::loop_status_from_mpris(status));
+            }
+            PlayerCommand::SetShuffle(shuffle) => {
+                if engine.shuffle() != shuffle {
+                    engine.toggle_shuffle();
+                }
+            }
+            PlayerCommand::SetVolume(v) => engine.set_volume(v as f32),
+            PlayerCommand::GoTo(path) => {
+                if let Some(id) = path.strip_prefix("/org/mpris/MediaPlayer2/Track/")
+                    && let Some(idx) = engine.queue().iter().position(|t| t.id == id)
+                {
+                    engine.play_index(idx);
+                }
+            }
+            PlayerCommand::Quit => *quit = true,
+        }
+        app.clear_message();
+    }
+}
+
+fn handle_engine_event(app: &mut AppState, ev: EngineEvent) {
+    match ev {
+        EngineEvent::TrackStarted { .. } => {}
+        EngineEvent::TrackEnded => {}
+        EngineEvent::QueueFinished => {
+            app.set_message("Queue finished", false);
+        }
+        EngineEvent::LoadFailed(title) => {
+            app.set_message(format!("Failed to load \"{title}\""), true);
+        }
+    }
+}
+
+/// Повний зліп стану движка → MPRIS: метадані, статуси та (при зміні черги) TrackList.
+fn refresh_mpris(
+    mpris: Option<&Mpris>,
+    engine: &Engine,
+    client: &Client,
+    last_queue_gen: &mut Option<usize>,
+) {
+    let Some(mpris) = mpris else {
+        *last_queue_gen = Some(engine.queue_gen());
+        return;
+    };
+    let playing = !engine.stopped() && !engine.paused();
+    let status = match engine.current() {
+        Some(_) if playing => PlaybackStatus::Playing,
+        Some(_) => PlaybackStatus::Paused,
+        None => PlaybackStatus::Stopped,
+    };
+    mpris.update(MprisUpdate::PlaybackStatus(status));
+
+    let has_next =
+        engine.queue_pos() + 1 < engine.queue().len() || engine.loop_mode() != LoopMode::None;
+    let has_prev = engine.queue_pos() > 0 || engine.loop_mode() == LoopMode::Playlist;
+    mpris.update(MprisUpdate::CanGoNext(has_next));
+    mpris.update(MprisUpdate::CanGoPrevious(has_prev));
+    mpris.update(MprisUpdate::CanPlay(!engine.queue().is_empty()));
+    mpris.update(MprisUpdate::CanPause(engine.current().is_some()));
+    mpris.update(MprisUpdate::CanSeek(engine.current().is_some()));
+    mpris.update(MprisUpdate::Volume(engine.volume() as f64));
+    mpris.update(MprisUpdate::LoopStatus(mpris::loop_status_to_mpris(&engine.loop_mode())));
+    mpris.update(MprisUpdate::Shuffle(engine.shuffle()));
+    mpris.update(MprisUpdate::Position(Time::from_secs(
+        engine.position().as_secs() as i64,
+    )));
+
+    match engine.current() {
+        Some(track) => {
+            let art = track.cover_art.as_deref().map(|c| client.cover_art_url(c));
+            mpris.update(MprisUpdate::Metadata(mpris::build_metadata(track, art)));
+        }
+        None => mpris.update(MprisUpdate::Metadata(mpris_server::Metadata::new())),
+    }
+
+    if *last_queue_gen != Some(engine.queue_gen()) {
+        *last_queue_gen = Some(engine.queue_gen());
+        let tracks: Vec<_> = engine
+            .queue()
+            .iter()
+            .map(|t| {
+                let art = t
+                    .cover_art
+                    .as_deref()
+                    .map(|c| client.cover_art_url(c));
+                (mpris::subsonic_track_id(&t.id), mpris::build_metadata(t, art))
+            })
+            .collect();
+        let current = engine.current().map(|t| mpris::subsonic_track_id(&t.id));
+        mpris.update(MprisUpdate::TrackList { tracks, current });
+    }
+}
+
+// ---------- стан ----------
+
+fn load_state_json(path: &Path) -> Result<EngineState> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+// ---------- малювання ----------
+
+fn draw(frame: &mut Frame, app: &AppState, engine: &Engine) {
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(4),
+    ])
+    .split(frame.area());
+
+    let tabs = Tabs::new(
+        Tab::ALL
+            .iter()
+            .map(|t| t.label().to_string())
+            .collect::<Vec<_>>(),
+    )
+    .select(Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0))
+    .divider(" | ")
+    .style(ui::theme::base())
+    .highlight_style(ui::theme::title(true));
+    frame.render_widget(tabs, areas[0]);
+
+    match app.tab {
+        Tab::Artists => ui::views::artists::render(frame, areas[1], app),
+        Tab::Albums => ui::views::albums::render(frame, areas[1], app),
+        Tab::Playlists => ui::views::tracks::render(frame, areas[1], app),
+    }
+    ui::views::now_playing::render(frame, areas[2], engine, app);
+}
+
+// ---------- тести ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_self() {
+        assert!(pid_alive(std::process::id()));
+    }
+}

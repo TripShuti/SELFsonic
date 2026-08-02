@@ -1,0 +1,32 @@
+[package]
+name = "selfsonic"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight TUI client for Subsonic servers (Navidrome, Airsonic, ...)"
+license = "MIT"
+repository = "https://github.com/TripShuti/selfsonic"
+keywords = ["subsonic", "navidrome", "tui", "music", "player"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+futures = "0.3.33"
+mpris-server = "0.10.0"
+rand = "0.9.1"
+ratatui = "0.30.2"
+rodio = { version = "0.22.2", features = ["playback", "experimental", "symphonia-flac", "symphonia-mp3", "symphonia-vorbis"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.20.0"
+thiserror = "2.0.19"
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.3.0", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"
