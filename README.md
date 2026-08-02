@@ -70,11 +70,6 @@ Bus name: `org.mpris.MediaPlayer2.SELFsonic`. Exposes:
 - `org.mpris.MediaPlayer2.TrackList` (queue as a playlist, with `TrackListReplaced` signals)
 
 
-```sh
-python3 tracklist.py --player SELFsonic list                # track ids
-python3 tracklist.py --player SELFsonic metadata /org/mpris/MediaPlayer2/Track/<id>...
-python3 tracklist.py --player SELFsonic goto /org/mpris/MediaPlayer2/Track/<id>
-```
 
 ## Config / data locations
 
