@@ -12,7 +12,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::{FutureExt as _, StreamExt as _};
 use mpris_server::{
     LocalRootInterface, LocalPlayerInterface, LocalServer, LocalTrackListInterface, LoopStatus,
-    Metadata, PlaybackRate, PlaybackStatus, Property, Time, TrackId, TrackListProperty,
+    Metadata, PlaybackRate, PlaybackStatus, Property, Signal, Time, TrackId, TrackListProperty,
     TrackListSignal, Uri, Volume,
 };
 use mpris_server::zbus::{self, fdo};
@@ -48,6 +48,7 @@ pub enum MprisUpdate {
     PlaybackStatus(PlaybackStatus),
     Metadata(Metadata),
     Position(Time),
+    Seeked(Time),
     Volume(Volume),
     LoopStatus(LoopStatus),
     Shuffle(bool),
@@ -205,6 +206,14 @@ impl MprisState {
             }
             MprisUpdate::Position(p) => {
                 self.position.set(p);
+            }
+            // Спека MPRIS: Position не можна міняти через PropertiesChanged —
+            // нелінійні зміни позиції сповіщаються сигналом Seeked (зміна треку,
+            // перемотка). Quickshell скидає базу інтерполяції позиції саме на нього,
+            // тож без нього прогрес-бар показує стару позицію попереднього треку.
+            MprisUpdate::Seeked(p) => {
+                self.position.set(p);
+                server.emit(Signal::Seeked { position: p }).await?;
             }
             MprisUpdate::Volume(v) => {
                 if self.volume.get() != v {

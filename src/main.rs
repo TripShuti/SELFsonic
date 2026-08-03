@@ -12,7 +12,7 @@ mod ui;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyEvent};
@@ -32,7 +32,6 @@ use crate::ui::app::{AppState, Tab};
 use crate::ui::keybindings::Action;
 
 const TICK: Duration = Duration::from_millis(50);
-const POSITION_PUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let config_path = parse_args()?;
@@ -98,7 +97,11 @@ fn main() -> Result<()> {
     }
 
     let mut last_queue_gen = None;
-    refresh_mpris(mpris.as_ref(), &engine, &client, &mut last_queue_gen);
+    let mut pos = PositionGuard {
+        last_published: Duration::ZERO,
+        switch_pending: false,
+    };
+    refresh_mpris(mpris.as_ref(), &engine, &client, &mut last_queue_gen, &mut pos);
 
     let res = run_tui(
         &mut app,
@@ -107,6 +110,7 @@ fn main() -> Result<()> {
         &mut engine,
         &mut mpris,
         &mut last_queue_gen,
+        &mut pos,
     );
 
     engine.save_state(&state_path);
@@ -210,10 +214,10 @@ fn run_tui(
     engine: &mut Engine,
     mpris: &mut Option<Mpris>,
     last_queue_gen: &mut Option<usize>,
+    pos: &mut PositionGuard,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut quit = false;
-    let mut last_position = Instant::now();
 
     let result: Result<()> = (|| {
         while !quit {
@@ -225,7 +229,7 @@ fn run_tui(
                 match event::read().context("event::read")? {
                     Event::Key(key) => {
                         if !handle_key(app, db, client, engine, key) {
-                            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen);
+                            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
                         } else {
                             quit = true;
                         }
@@ -237,21 +241,9 @@ fn run_tui(
 
             drain_mpris_commands(mpris.as_ref(), engine, app, &mut quit);
             for ev in engine.poll_events() {
-                handle_engine_event(app, ev);
+                handle_engine_event(mpris.as_ref(), app, ev, pos);
             }
-            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen);
-
-            // Періодичне оновлення позиції в MPRIS.
-            if last_position.elapsed() >= POSITION_PUSH_INTERVAL {
-                last_position = Instant::now();
-                if let Some(m) = mpris.as_ref()
-                    && engine.current().is_some()
-                {
-                    m.update(MprisUpdate::Position(Time::from_secs(
-                        engine.position().as_secs() as i64,
-                    )));
-                }
-            }
+            refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
 
             // Авто-підвантаження наступної сторінки альбомів.
             if app.tab == Tab::Albums
@@ -356,6 +348,12 @@ fn drain_mpris_commands(
             PlayerCommand::Stop => engine.stop(),
             PlayerCommand::Seek { offset_us } => {
                 engine.seek_relative(offset_us / 1_000_000);
+                // Спека MPRIS: після нелінійної зміни позиції клієнти мають
+                // отримати Seeked з фактичною позицією, інакше вони інтерполюють
+                // від старого значення.
+                mpris.update(MprisUpdate::Seeked(Time::from_secs(
+                    engine.position().as_secs() as i64,
+                )));
             }
             PlayerCommand::SetPosition { track_id, position_us } => {
                 if let Ok(tid) = TrackId::try_from(track_id)
@@ -363,6 +361,9 @@ fn drain_mpris_commands(
                     && engine.current().is_some_and(|t| t.id == id)
                 {
                     engine.seek_to(Duration::from_micros(position_us as u64));
+                    mpris.update(MprisUpdate::Seeked(Time::from_secs(
+                        engine.position().as_secs() as i64,
+                    )));
                 }
             }
             PlayerCommand::OpenUri(uri) => {
@@ -390,9 +391,18 @@ fn drain_mpris_commands(
     }
 }
 
-fn handle_engine_event(app: &mut AppState, ev: EngineEvent) {
+fn handle_engine_event(mpris: Option<&Mpris>, app: &mut AppState, ev: EngineEvent, pos: &mut PositionGuard) {
     match ev {
-        EngineEvent::TrackStarted { .. } => {}
+        EngineEvent::TrackStarted { .. } => {
+            // Спека MPRIS: нелінійна зміна позиції → Seeked. Без цього клієнти
+            // (Quickshell) інтерполюють позицію від старого треку.
+            if let Some(m) = mpris {
+                m.update(MprisUpdate::Seeked(Time::ZERO));
+            }
+            // Позиція rodio ще може тримати значення старого треку — не
+            // публікуємо її, поки вона не відкотилась (див. PositionGuard).
+            pos.switch_pending = true;
+        }
         EngineEvent::TrackEnded => {}
         EngineEvent::QueueFinished => {
             app.set_message("Queue finished", false);
@@ -403,12 +413,26 @@ fn handle_engine_event(app: &mut AppState, ev: EngineEvent) {
     }
 }
 
+/// Guard публікації позиції в MPRIS.
+///
+/// Після зміни треку rodio скидає позицію в 0 асинхронно (5мс тік аудіопотоку),
+/// тож у вікні перемикання `engine.position()` ще віддає позицію СТАРОГО треку.
+/// Якщо її опублікувати, клієнт (Quickshell) перезапише скинуту `Seeked(0)`
+/// позицію старою і прогрес-бар зависне на прогресу попереднього треку.
+/// Публікуємо реальну позицію лише коли вона відкотилась нижче останньої
+/// опублікованої — тобто це точно вже новий трек.
+struct PositionGuard {
+    last_published: Duration,
+    switch_pending: bool,
+}
+
 /// Повний зліп стану движка → MPRIS: метадані, статуси та (при зміні черги) TrackList.
 fn refresh_mpris(
     mpris: Option<&Mpris>,
     engine: &Engine,
     client: &Client,
     last_queue_gen: &mut Option<usize>,
+    pos: &mut PositionGuard,
 ) {
     let Some(mpris) = mpris else {
         *last_queue_gen = Some(engine.queue_gen());
@@ -433,9 +457,23 @@ fn refresh_mpris(
     mpris.update(MprisUpdate::Volume(engine.volume() as f64));
     mpris.update(MprisUpdate::LoopStatus(mpris::loop_status_to_mpris(&engine.loop_mode())));
     mpris.update(MprisUpdate::Shuffle(engine.shuffle()));
-    mpris.update(MprisUpdate::Position(Time::from_secs(
-        engine.position().as_secs() as i64,
-    )));
+
+    let raw = engine.position();
+    let published = if pos.switch_pending {
+        if raw < pos.last_published {
+            // Позиція відкотилась нижче попередньої — це вже новий трек.
+            pos.switch_pending = false;
+            pos.last_published = raw;
+            raw
+        } else {
+            // rodio ще віддає позицію старого треку — тримаємо 0 (після Seeked).
+            Duration::ZERO
+        }
+    } else {
+        pos.last_published = raw;
+        raw
+    };
+    mpris.update(MprisUpdate::Position(Time::from_secs(published.as_secs() as i64)));
 
     match engine.current() {
         Some(track) => {

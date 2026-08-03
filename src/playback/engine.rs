@@ -376,7 +376,11 @@ impl Engine {
 
     fn decode(&self, track: &TrackMeta) -> Result<Decoder> {
         let stream = self.client.stream(&track.id)?;
-        Decoder::new(stream.reader)
+        // seekable=true: без нього symphonia вважає потік forward-only — перемотка назад не працює
+        Decoder::builder()
+            .with_seekable(true)
+            .with_data(stream.reader)
+            .build()
             .map_err(|e| AppError::Audio(format!("decode '{}': {e}", track.title)))
     }
 
@@ -592,7 +596,11 @@ fn spawn_preloader(
                 };
                 let res = (|| -> Result<Decoder> {
                     let stream = client.stream(&track.id)?;
-                    Decoder::new(stream.reader)
+                    // seekable=true: без нього symphonia вважає потік forward-only — перемотка назад не працює
+                    Decoder::builder()
+                        .with_seekable(true)
+                        .with_data(stream.reader)
+                        .build()
                         .map_err(|e| AppError::Audio(format!("preload '{}': {e}", track.title)))
                 })();
                 if preload_gen.load(Ordering::SeqCst) != my_gen {
