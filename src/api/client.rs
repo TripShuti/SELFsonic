@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use tracing::{debug, warn};
 
 use crate::api::auth;
@@ -74,7 +75,9 @@ impl Client {
             url.push_str(if i == 0 { "?" } else { "&" });
             url.push_str(k);
             url.push('=');
-            url.push_str(v);
+            // Значення (пароль, id треку тощо) кодуємо: `&`, `=`, `#`, `%`,
+            // пробіл і не-ASCII символи ламали б query або авторизацію.
+            url.push_str(&utf8_percent_encode(v, NON_ALPHANUMERIC).to_string());
         }
         url
     }
@@ -348,6 +351,30 @@ impl Seek for StreamFile {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+
+    /// URL-encoding значень параметрів: `&`, `=` та пробіл у паролі мають
+    /// бути закодовані, а після декодування — збігатися з оригіналом.
+    #[test]
+    fn url_percent_encodes_param_values() {
+        let client = Client::new("http://example.com", "user", "p@ss word&x=1%#").unwrap();
+        let url = client.url("ping", &[("id", "track id 1".into())]);
+        let (_, query) = url.split_once('?').expect("має бути query-рядок");
+        let params: std::collections::HashMap<_, _> = query
+            .split('&')
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').expect("пара к=значення");
+                let v = percent_encoding::percent_decode_str(v)
+                    .decode_utf8()
+                    .unwrap()
+                    .to_string();
+                (k, v)
+            })
+            .collect();
+        assert_eq!(params.get("p").unwrap(), "p@ss word&x=1%#");
+        assert_eq!(params.get("id").unwrap(), "track id 1");
+        // Сирі символи не мають з'явитися у query.
+        assert!(!query.contains("p@ss word"));
+    }
 
     /// Діагностика проти реального сервера (треба конфіг користувача).
     #[test]

@@ -13,7 +13,9 @@ anyhow = "1.0.104"
 crossterm = "0.29.0"
 dirs = "6.0.0"
 futures = "0.3.33"
+libc = "0.2.189"
 mpris-server = "0.10.0"
+percent-encoding = "2.3.2"
 rand = "0.9.1"
 ratatui = "0.30.2"
 rodio = { version = "0.22.2", features = ["playback", "experimental", "symphonia-flac", "symphonia-mp3", "symphonia-vorbis"] }
@@ -21,6 +23,8 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.20.0"
+terminal-colorsaurus = "1.0.3"
+terminal-trx = "0.2.6"
 thiserror = "2.0.19"
 toml = "1.1.4"
 tracing = "0.1.44"

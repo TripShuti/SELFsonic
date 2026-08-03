@@ -24,13 +24,13 @@ fn row_item(item: &ListItem) -> TuiListItem<'static> {
             Span::raw(name.clone()),
             Span::styled(
                 format!("  · {} alb.", album_count.unwrap_or(0)),
-                theme::FG_DIM,
+                theme::fg_dim(),
             ),
         ]),
         ListItem::Album { name, artist, year, duration, .. } => {
             let mut spans = vec![
-                Span::styled(name.clone(), theme::FG),
-                Span::styled(format!("  — {artist}"), theme::FG_DIM),
+                Span::styled(name.clone(), theme::fg()),
+                Span::styled(format!("  — {artist}"), theme::fg_dim()),
             ];
             let right = format!(
                 "{}{}",
@@ -41,7 +41,7 @@ fn row_item(item: &ListItem) -> TuiListItem<'static> {
                     String::new()
                 }
             );
-            spans.push(Span::styled(right, theme::FG_DIM));
+            spans.push(Span::styled(right, theme::fg_dim()));
             Line::from(spans)
         }
         ListItem::Track(t) => {
@@ -50,27 +50,27 @@ fn row_item(item: &ListItem) -> TuiListItem<'static> {
                 .map(|n| format!("{n:>2}. "))
                 .unwrap_or_default();
             let mut spans = vec![
-                Span::styled(num, theme::FG_DIM),
-                Span::styled(t.title.clone(), theme::FG),
+                Span::styled(num, theme::fg_dim()),
+                Span::styled(t.title.clone(), theme::fg()),
             ];
             if !t.artist.is_empty() {
-                spans.push(Span::styled(format!("  — {}", t.artist), theme::FG_DIM));
+                spans.push(Span::styled(format!("  — {}", t.artist), theme::fg_dim()));
             }
             if t.duration > 0 {
                 spans.push(Span::styled(
                     format!("  {}", fmt_duration(t.duration)),
-                    theme::FG_DIM,
+                    theme::fg_dim(),
                 ));
             }
             Line::from(spans)
         }
         ListItem::Playlist { name, song_count, .. } => Line::from(vec![
             Span::raw(name.clone()),
-            Span::styled(format!("  · {song_count} tracks"), theme::FG_DIM),
+            Span::styled(format!("  · {song_count} tracks"), theme::fg_dim()),
         ]),
         ListItem::More => Line::styled(
             "--- load more ---",
-            Style::default().fg(theme::FG_DIM).italic(),
+            Style::default().fg(theme::fg_dim()).italic(),
         ),
     };
     TuiListItem::new(line)
@@ -89,7 +89,7 @@ pub fn render_list(
     selected: usize,
 ) {
     let list = List::new(row_items(items))
-        .block(Block::bordered().title(title).border_style(theme::FG_DIM))
+        .block(Block::bordered().title(title).border_style(theme::border()))
         .highlight_style(list_row_style(true))
         .highlight_symbol("> ")
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);

@@ -18,8 +18,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &AppState) {
 fn render_empty(frame: &mut Frame, area: Rect, msg: &str) {
     let block = ratatui::widgets::Block::bordered()
         .title("Artists")
-        .border_style(theme::FG_DIM);
-    let text = ratatui::text::Text::styled(msg, theme::FG_DIM);
+        .border_style(theme::border());
+    let text = ratatui::text::Text::styled(msg, theme::fg_dim());
     let paragraph = ratatui::widgets::Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 }

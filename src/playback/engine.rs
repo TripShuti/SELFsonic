@@ -387,7 +387,7 @@ impl Engine {
     fn request_preload(&mut self) {
         let next = self.peek_next();
         if let Some(track) = next {
-            let gen_id = self.preload_gen.fetch_add(1, Ordering::SeqCst);
+            let gen_id = next_preload_gen(&self.preload_gen);
             self.preload_tx
                 .send(PreloadCmd::Decode { track, gen_id })
                 .ok();
@@ -566,6 +566,15 @@ impl Drop for Engine {
     }
 }
 
+/// Виділяє наступний ідентифікатор генерації preload-декодування.
+/// `fetch_add` повертає значення ДО інкременту, тож додаємо 1, щоб
+/// `gen_id` збігався зі значенням атоміка вже на момент надсилання
+/// команди — інакше перевірка `load() != my_gen` у `spawn_preloader`
+/// хибно відкидає завжди актуальний preload.
+fn next_preload_gen(counter: &AtomicUsize) -> usize {
+    counter.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 fn save_state_json(path: &Path, state: &EngineState) -> Result<()> {
     let raw = serde_json::to_string_pretty(state)
         .map_err(|e| AppError::Other(format!("state serialize: {e}")))?;
@@ -683,5 +692,21 @@ mod tests {
         assert_eq!(back.volume, 0.5);
         assert_eq!(back.queue_pos, 1);
         assert_eq!(back.loop_mode, LoopMode::Track);
+    }
+
+    #[test]
+    fn preload_gen_matches_value_seen_by_preloader() {
+        // Імітація `request_preload()`: після алокації gen_id атомік вже
+        // має саме це значення, тож перевірка `load() != my_gen` у
+        // `spawn_preloader` не відкидає команду хибно.
+        let counter = AtomicUsize::new(0);
+        let my_gen = next_preload_gen(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), my_gen);
+        // Якщо між алокацією і початком декодування генерацію ніхто не
+        // інвалідував (зміна черги, stop) — порівняння залишається вірним.
+        assert_eq!(counter.load(Ordering::SeqCst), my_gen);
+        // Після інвалідації (fetch_add) застарілий gen_id вже не пройде.
+        counter.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(counter.load(Ordering::SeqCst), my_gen);
     }
 }

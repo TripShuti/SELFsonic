@@ -216,6 +216,7 @@ fn run_tui(
     last_queue_gen: &mut Option<usize>,
     pos: &mut PositionGuard,
 ) -> Result<()> {
+    ui::theme::init();
     let mut terminal = ratatui::init();
     let mut quit = false;
 

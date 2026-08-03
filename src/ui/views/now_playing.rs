@@ -15,17 +15,17 @@ use super::{fmt_duration, fmt_volume};
 
 pub fn render(frame: &mut Frame, area: Rect, engine: &Engine, app: &AppState) {
     let height = area.height.saturating_sub(1);
-    let bar = Block::bordered().border_style(theme::FG_DIM);
+    let bar = Block::bordered().border_style(theme::border());
     let inner = bar.inner(area);
 
     let mut lines: Vec<Line> = Vec::new();
 
     // Error/status line, if any.
     if let Some(msg) = &app.message {
-        let style = if msg.is_error { theme::RED } else { theme::GREEN };
+        let style = if msg.is_error { theme::red() } else { theme::green() };
         lines.push(Line::from(Span::styled(msg.text.clone(), style)));
     } else if app.loading {
-        lines.push(Line::from(Span::styled("Loading...", theme::YELLOW)));
+        lines.push(Line::from(Span::styled("Loading...", theme::yellow())));
     }
 
     match engine.current() {
@@ -50,18 +50,18 @@ pub fn render(frame: &mut Frame, area: Rect, engine: &Engine, app: &AppState) {
                 let bar_width = (inner.width as usize).saturating_sub(fixed).max(10);
                 let filled = (bar_width as f64 * ratio).round() as usize;
                 let spans = vec![
-                    Span::styled(fmt_duration(pos.as_secs() as i32), theme::FG_DIM),
+                    Span::styled(fmt_duration(pos.as_secs() as i32), theme::fg_dim()),
                     Span::raw("  "),
-                    Span::styled("[", theme::FG_DIM),
-                    Span::styled("█".repeat(filled), theme::GREEN),
-                    Span::styled("░".repeat(bar_width.saturating_sub(filled)), theme::FG_DIM),
-                    Span::styled("]", theme::FG_DIM),
+                    Span::styled("[", theme::fg_dim()),
+                    Span::styled("█".repeat(filled), theme::green()),
+                    Span::styled("░".repeat(bar_width.saturating_sub(filled)), theme::fg_dim()),
+                    Span::styled("]", theme::fg_dim()),
                     Span::raw("  "),
-                    Span::styled(fmt_duration(track.duration), theme::FG_DIM),
+                    Span::styled(fmt_duration(track.duration), theme::fg_dim()),
                     Span::raw("  "),
                     Span::styled(
                         format!("{:3}%", (ratio * 100.0).round() as u32),
-                        theme::YELLOW,
+                        theme::yellow(),
                     ),
                 ];
                 Line::from(spans)
@@ -74,17 +74,17 @@ pub fn render(frame: &mut Frame, area: Rect, engine: &Engine, app: &AppState) {
                 if engine.shuffle() { "shuffle: on" } else { "shuffle: off" },
                 fmt_volume(engine.volume()),
             );
-            lines.push(Line::from(Span::styled(controls, theme::FG_DIM)));
+            lines.push(Line::from(Span::styled(controls, theme::fg_dim())));
         }
         None => {
             lines.push(Line::from(Span::styled(
                 "Nothing playing — press Enter on an album or track.  (r — refresh library, q — quit)",
-                theme::FG_DIM,
+                theme::fg_dim(),
             )));
             if height > 1 {
                 lines.push(Line::from(Span::styled(
                     "space pause  n/p next/prev  l repeat  s shuffle  +/- volume  [ / ] seek",
-                    theme::FG_DIM,
+                    theme::fg_dim(),
                 )));
             }
         }
