@@ -12,7 +12,7 @@ mod ui;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyEvent};
@@ -97,10 +97,7 @@ fn main() -> Result<()> {
     }
 
     let mut last_queue_gen = None;
-    let mut pos = PositionGuard {
-        last_published: Duration::ZERO,
-        switch_pending: false,
-    };
+    let mut pos = PositionGuard::new();
     refresh_mpris(mpris.as_ref(), &engine, &client, &mut last_queue_gen, &mut pos);
 
     let res = run_tui(
@@ -242,7 +239,7 @@ fn run_tui(
 
             drain_mpris_commands(mpris.as_ref(), engine, app, &mut quit);
             for ev in engine.poll_events() {
-                handle_engine_event(mpris.as_ref(), app, ev, pos);
+                handle_engine_event(mpris.as_ref(), app, ev, pos, engine.position());
             }
             refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
 
@@ -392,7 +389,13 @@ fn drain_mpris_commands(
     }
 }
 
-fn handle_engine_event(mpris: Option<&Mpris>, app: &mut AppState, ev: EngineEvent, pos: &mut PositionGuard) {
+fn handle_engine_event(
+    mpris: Option<&Mpris>,
+    app: &mut AppState,
+    ev: EngineEvent,
+    pos: &mut PositionGuard,
+    raw_position: Duration,
+) {
     match ev {
         EngineEvent::TrackStarted { .. } => {
             // Спека MPRIS: нелінійна зміна позиції → Seeked. Без цього клієнти
@@ -400,9 +403,10 @@ fn handle_engine_event(mpris: Option<&Mpris>, app: &mut AppState, ev: EngineEven
             if let Some(m) = mpris {
                 m.update(MprisUpdate::Seeked(Time::ZERO));
             }
-            // Позиція rodio ще може тримати значення старого треку — не
-            // публікуємо її, поки вона не відкотилась (див. PositionGuard).
-            pos.switch_pending = true;
+            // Фіксуємо позицію, яку rodio віддає прямо зараз: у вікні
+            // перемикання вона ще може належати старому треку (див.
+            // PositionGuard::on_track_started).
+            pos.on_track_started(raw_position);
         }
         EngineEvent::TrackEnded => {}
         EngineEvent::QueueFinished => {
@@ -414,17 +418,69 @@ fn handle_engine_event(mpris: Option<&Mpris>, app: &mut AppState, ev: EngineEven
     }
 }
 
+/// Час, після якого позиція публікується завжди, навіть якщо вона не змінилась
+/// відносно `baseline` (запобіжник: старий і новий трек можуть мати однакову
+/// позицію в момент переходу, напр. обидва на позиції 0).
+const SWITCH_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Guard публікації позиції в MPRIS.
 ///
 /// Після зміни треку rodio скидає позицію в 0 асинхронно (5мс тік аудіопотоку),
 /// тож у вікні перемикання `engine.position()` ще віддає позицію СТАРОГО треку.
 /// Якщо її опублікувати, клієнт (Quickshell) перезапише скинуту `Seeked(0)`
 /// позицію старою і прогрес-бар зависне на прогресу попереднього треку.
-/// Публікуємо реальну позицію лише коли вона відкотилась нижче останньої
-/// опублікованої — тобто це точно вже новий трек.
+/// Публікуємо реальну позицію лише тоді, коли вона змінилась відносно позиції,
+/// зафіксованої в момент `TrackStarted` (тобто rodio вже віддає позицію нового
+/// треку), або через `SWITCH_TIMEOUT` — порівняння з нулем тут не працює,
+/// бо `Duration` беззнаковий і ніколи не буває меншим за 0.
 struct PositionGuard {
-    last_published: Duration,
     switch_pending: bool,
+    /// Позиція в момент `TrackStarted` — ще може бути позицією старого треку.
+    baseline: Duration,
+    /// Момент початку перемикання (для запобіжного таймауту).
+    switch_started: Instant,
+}
+
+impl PositionGuard {
+    fn new() -> Self {
+        Self {
+            switch_pending: false,
+            baseline: Duration::ZERO,
+            switch_started: Instant::now(),
+        }
+    }
+
+    /// Викликається на `TrackStarted`: фіксуємо позицію, яку rodio віддає
+    /// прямо зараз (позицію старого треку, що ще не скинулась).
+    fn on_track_started(&mut self, raw: Duration) {
+        self.switch_pending = true;
+        self.baseline = raw;
+        self.switch_started = Instant::now();
+    }
+
+    fn next(&mut self, raw: Duration) -> Duration {
+        self.step(raw, self.switch_started.elapsed())
+    }
+
+    /// Чиста логіка публікації: `elapsed` передається явно, щоб тестувати
+    /// поведінку таймауту без реального очікування.
+    fn step(&mut self, raw: Duration, elapsed: Duration) -> Duration {
+        if self.switch_pending {
+            // Позиція змінилась відносно зафіксованої — це точно вже новий
+            // трек. Або минув запобіжний таймаут.
+            if raw != self.baseline || elapsed >= SWITCH_TIMEOUT {
+                self.switch_pending = false;
+                self.baseline = raw;
+                raw
+            } else {
+                // rodio ще віддає позицію старого треку — тримаємо 0 (після Seeked).
+                Duration::ZERO
+            }
+        } else {
+            self.baseline = raw;
+            raw
+        }
+    }
 }
 
 /// Повний зліп стану движка → MPRIS: метадані, статуси та (при зміні черги) TrackList.
@@ -460,20 +516,7 @@ fn refresh_mpris(
     mpris.update(MprisUpdate::Shuffle(engine.shuffle()));
 
     let raw = engine.position();
-    let published = if pos.switch_pending {
-        if raw < pos.last_published {
-            // Позиція відкотилась нижче попередньої — це вже новий трек.
-            pos.switch_pending = false;
-            pos.last_published = raw;
-            raw
-        } else {
-            // rodio ще віддає позицію старого треку — тримаємо 0 (після Seeked).
-            Duration::ZERO
-        }
-    } else {
-        pos.last_published = raw;
-        raw
-    };
+    let published = pos.next(raw);
     mpris.update(MprisUpdate::Position(Time::from_secs(published.as_secs() as i64)));
 
     match engine.current() {
@@ -548,5 +591,55 @@ mod tests {
     #[test]
     fn pid_alive_self() {
         assert!(pid_alive(std::process::id()));
+    }
+
+    /// Перший трек сесії: baseline=0, і `raw < 0` неможливий — старий механізм
+    /// тут застрягав назавжди. Тепер вихід — за різницею від baseline.
+    #[test]
+    fn position_publishes_after_first_track_from_zero() {
+        let mut pos = PositionGuard::new();
+        pos.on_track_started(Duration::ZERO);
+        // Поки rodio тримає 0 — публікуємо 0 (після Seeked(0)).
+        assert_eq!(pos.next(Duration::ZERO), Duration::ZERO);
+        assert_eq!(pos.next(Duration::ZERO), Duration::ZERO);
+        // Позиція рушила з місця — це вже новий трек, публікуємо реальну.
+        let p = pos.next(Duration::from_millis(50));
+        assert_eq!(p, Duration::from_millis(50));
+        // Надалі позиція публікується напряму.
+        assert_eq!(pos.next(Duration::from_secs(12)), Duration::from_secs(12));
+    }
+
+    /// Перемикання зі старого треку на 45-й секунді: поки rodio тримає
+    /// стару позицію — тримаємо 0, щоб не затерти Seeked(0).
+    #[test]
+    fn position_hides_old_track_value_until_switch() {
+        let mut pos = PositionGuard::new();
+        pos.on_track_started(Duration::from_secs(45));
+        assert_eq!(pos.next(Duration::from_secs(45)), Duration::ZERO);
+        assert_eq!(pos.next(Duration::from_secs(45)), Duration::ZERO);
+        // rodio скинув позицію — публікуємо значення нового треку.
+        assert_eq!(pos.next(Duration::ZERO), Duration::ZERO);
+        assert_eq!(pos.next(Duration::from_millis(10)), Duration::from_millis(10));
+    }
+
+    /// Запобіжник: старий і новий трек мають однакову позицію (0) — різниця
+    /// від baseline не спрацює, вихід за таймаутом.
+    #[test]
+    fn position_switch_falls_back_to_timeout() {
+        let mut pos = PositionGuard::new();
+        pos.on_track_started(Duration::ZERO);
+        assert_eq!(pos.next(Duration::ZERO), Duration::ZERO);
+        // Після SWITCH_TIMEOUT публікуємо позицію навіть без її зміни.
+        assert_eq!(pos.step(Duration::ZERO, SWITCH_TIMEOUT), Duration::ZERO);
+        // Guard більше не pending — позиція публікується напряму.
+        assert_eq!(pos.next(Duration::from_secs(1)), Duration::from_secs(1));
+    }
+
+    /// Звичайна гра без перемикань: позиція проходить наскрізь.
+    #[test]
+    fn position_passes_through_when_no_switch() {
+        let mut pos = PositionGuard::new();
+        assert_eq!(pos.next(Duration::from_secs(1)), Duration::from_secs(1));
+        assert_eq!(pos.next(Duration::from_secs(2)), Duration::from_secs(2));
     }
 }
