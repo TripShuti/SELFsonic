@@ -235,6 +235,13 @@ pub struct PlaylistWithSongs {
     pub entry: Vec<Child>,
 }
 
+// ---------- scrobble (відповідь без payload) ----------
+
+/// Відповідь без корисного навантаження: scrobble повертає лише `status`.
+/// Типуємо її як `SubsonicResponse<EmptyPayload>`, а сам `data` відсутній.
+#[derive(Debug, Deserialize)]
+pub struct EmptyPayload {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +279,16 @@ mod tests {
         let payload = resp.response.data.unwrap();
         let lists = payload.playlists.unwrap();
         assert!(lists.playlist.is_empty());
+    }
+
+    #[test]
+    fn parse_scrobble_ok_has_no_data() {
+        // scrobble не повертає даних — лише `status`. Порожній `EmptyPayload`
+        // десеріалізується навіть з відсутнього `data`, тож `call()` проходить.
+        let json = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let resp: SubsonicResponse<EmptyPayload> = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.response.status, "ok");
+        assert!(resp.response.data.is_some());
     }
 
     #[test]

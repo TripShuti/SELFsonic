@@ -178,6 +178,21 @@ impl Client {
         Ok(payload.playlist)
     }
 
+    /// Scrobble: `submission=false` — "Now Playing", `submission=true` —
+    /// зарахування прослуховування (Last.fm; Navidrome позначає трек як played).
+    /// Відповідь без payload (лише `status`) — `EmptyPayload` десеріалізується
+    /// навіть з порожнього `data`. Виконується у фоновому потоці.
+    pub fn scrobble(&self, id: &str, submission: bool) -> Result<()> {
+        let _: EmptyPayload = self.call(
+            "scrobble",
+            &[
+                ("id", id.to_string()),
+                ("submission", submission.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// URL обкладинки (MPRIS `mpris:artUrl` — віддаємо напряму).
     pub fn cover_art_url(&self, cover_art: &str) -> String {
         self.url("getCoverArt", &[("id", cover_art.to_string())])

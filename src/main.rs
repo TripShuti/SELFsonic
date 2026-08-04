@@ -241,6 +241,7 @@ fn run_tui(
             for ev in engine.poll_events() {
                 handle_engine_event(mpris.as_ref(), app, ev, pos, engine.position());
             }
+            engine.maybe_scrobble();
             refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
 
             // Авто-підвантаження наступної сторінки альбомів.

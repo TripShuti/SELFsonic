@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::seq::SliceRandom;
 use rodio::Source;
@@ -61,6 +61,30 @@ impl From<&CachedTrack> for TrackMeta {
             track_number: t.track_number,
             disc_number: t.disc_number,
         }
+    }
+}
+
+/// Мінімальний час відтворення для зарахування прослуховування (Last.fm): 4 хвилини.
+const SCROBBLE_MIN_PLAY_SECS: u64 = 4 * 60;
+/// Вікно одразу після перемикання треку, коли rodio ще може віддавати позицію
+/// попереднього — скроблимо лише після нього, щоб не зарахувати новий трек.
+const SCROBBLE_SWITCH_GUARD: Duration = Duration::from_millis(200);
+
+/// Чи настав час зараховувати прослуховування (submission=true)?
+/// Поріг: половина тривалості або 4 хвилини відтворення — що настане раніше.
+fn should_scrobble(position: Duration, duration: Duration) -> bool {
+    position >= scrobble_threshold(duration)
+}
+
+/// Поріг зарахування: `min(тривалість / 2, 4 хв)`. Невідома тривалість (0)
+/// трактується як довгий трек — тоді спрацьовує 4-хвилинний поріг.
+fn scrobble_threshold(duration: Duration) -> Duration {
+    let half = duration / 2;
+    let min_play = Duration::from_secs(SCROBBLE_MIN_PLAY_SECS);
+    if half.is_zero() {
+        min_play
+    } else {
+        half.min(min_play)
     }
 }
 
@@ -146,12 +170,23 @@ pub struct Engine {
     events: std::sync::mpsc::Receiver<EngineEvent>,
     event_tx: std::sync::mpsc::Sender<EngineEvent>,
     end_tx: std::sync::mpsc::Sender<Arc<AtomicBool>>,
+    scrobble_tx: std::sync::mpsc::Sender<ScrobbleCmd>,
+    /// Чи зараховано поточний трек (submission=true) — скидається на TrackStarted.
+    scrobbled: bool,
+    /// Момент старту поточного треку (захист від стрибка позиції при перемиканні).
+    track_started_at: Instant,
     /// Лічильник змін черги (для MPRIS TrackList).
     queue_gen: usize,
 }
 
 enum PreloadCmd {
     Decode { track: TrackMeta, gen_id: usize },
+    Shutdown,
+}
+
+enum ScrobbleCmd {
+    /// Надіслати scrobble-запит: `submission=false` — Now Playing, `true` — зарахування.
+    Send { id: String, submission: bool },
     Shutdown,
 }
 
@@ -169,11 +204,13 @@ impl Engine {
         let (event_tx, events) = std::sync::mpsc::channel();
         let (preload_tx, preload_rx) = std::sync::mpsc::channel();
         let (end_tx, end_rx) = std::sync::mpsc::channel();
+        let (scrobble_tx, scrobble_rx) = std::sync::mpsc::channel();
         let next_ready = Arc::new(Mutex::new(None));
         let preload_gen = Arc::new(AtomicUsize::new(0));
 
         spawn_preloader(preload_rx, next_ready.clone(), preload_gen.clone(), client.clone());
         spawn_end_monitor(end_rx, event_tx.clone());
+        spawn_scrobbler(scrobble_rx, client.clone());
 
         let engine = Self {
             client,
@@ -195,6 +232,9 @@ impl Engine {
             events,
             event_tx,
             end_tx,
+            scrobble_tx,
+            scrobbled: false,
+            track_started_at: Instant::now(),
             queue_gen: 0,
         };
         engine.player.set_volume(volume);
@@ -237,6 +277,27 @@ impl Engine {
 
     pub fn position(&self) -> Duration {
         self.player.get_pos()
+    }
+
+    /// Перевірка моменту зарахування (submission=true), викликається з UI-циклу
+    /// що ~50мс. Сам мережевий виклик іде у фоновому потоці — UI не блокується.
+    pub fn maybe_scrobble(&mut self) {
+        if self.scrobbled || self.stopped {
+            return;
+        }
+        let Some(track) = self.current.as_ref() else { return };
+        // rodio одразу після перемикання треку ще віддає позицію старого
+        // (див. PositionGuard у main.rs) — чекаємо вікно перемикання.
+        if self.track_started_at.elapsed() < SCROBBLE_SWITCH_GUARD {
+            return;
+        }
+        let duration = Duration::from_secs(track.duration.max(0) as u64);
+        if should_scrobble(self.position(), duration) {
+            self.scrobbled = true;
+            self.scrobble_tx
+                .send(ScrobbleCmd::Send { id: track.id.clone(), submission: true })
+                .ok();
+        }
     }
 
     pub fn state_snapshot(&self) -> EngineState {
@@ -354,6 +415,14 @@ impl Engine {
 
         self.current = Some(track);
         self.paused = false;
+        self.scrobbled = false;
+        self.track_started_at = Instant::now();
+        // Now Playing (submission=false) — асинхронно, у фоновому потоці.
+        if let Some(t) = self.current.as_ref() {
+            self.scrobble_tx
+                .send(ScrobbleCmd::Send { id: t.id.clone(), submission: false })
+                .ok();
+        }
         self.player.play();
         self.event_tx.send(EngineEvent::TrackStarted { queue_index: track_idx }).ok();
         self.request_preload();
@@ -563,6 +632,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.preload_tx.send(PreloadCmd::Shutdown).ok();
+        self.scrobble_tx.send(ScrobbleCmd::Shutdown).ok();
     }
 }
 
@@ -664,6 +734,24 @@ fn spawn_end_monitor(
         });
 }
 
+/// Потік скроблінгу: мережеві запити (Now Playing / зарахування) виконуються
+/// тут, а не в UI-потоці. Помилки логуємо і продовжуємо — програти не має.
+fn spawn_scrobbler(rx: std::sync::mpsc::Receiver<ScrobbleCmd>, client: Arc<Client>) {
+    let _ = std::thread::Builder::new()
+        .name("selfsonic-scrobble".into())
+        .spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                let (id, submission) = match cmd {
+                    ScrobbleCmd::Send { id, submission } => (id, submission),
+                    ScrobbleCmd::Shutdown => break,
+                };
+                if let Err(e) = client.scrobble(&id, submission) {
+                    warn!("scrobble (submission={submission}) '{id}': {e}");
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +796,35 @@ mod tests {
         // Після інвалідації (fetch_add) застарілий gen_id вже не пройде.
         counter.fetch_add(1, Ordering::SeqCst);
         assert_ne!(counter.load(Ordering::SeqCst), my_gen);
+    }
+
+    /// Трек коротший за 8 хв: поріг — рівно половина тривалості.
+    #[test]
+    fn scrobble_short_track_threshold_is_half() {
+        let duration = Duration::from_secs(6 * 60);
+        assert_eq!(scrobble_threshold(duration), Duration::from_secs(3 * 60));
+        assert!(!should_scrobble(Duration::from_secs(3 * 60 - 1), duration));
+        assert!(should_scrobble(Duration::from_secs(3 * 60), duration));
+        assert!(should_scrobble(Duration::from_secs(5 * 60), duration));
+    }
+
+    /// Довгий трек: 4-хвилинний поріг спрацьовує раніше за половину.
+    #[test]
+    fn scrobble_long_track_threshold_is_four_minutes() {
+        let duration = Duration::from_secs(20 * 60);
+        assert_eq!(scrobble_threshold(duration), Duration::from_secs(4 * 60));
+        assert!(!should_scrobble(Duration::from_secs(4 * 60 - 1), duration));
+        assert!(should_scrobble(Duration::from_secs(4 * 60), duration));
+        // Половина (10 хв) — явно не поріг для такого треку.
+        assert!(should_scrobble(Duration::from_secs(10 * 60), duration));
+    }
+
+    /// Невідома тривалість (0): не скроблимо одразу, а лише після 4 хв.
+    #[test]
+    fn scrobble_unknown_duration_falls_back_to_four_minutes() {
+        let duration = Duration::ZERO;
+        assert_eq!(scrobble_threshold(duration), Duration::from_secs(4 * 60));
+        assert!(!should_scrobble(Duration::from_secs(3 * 60), duration));
+        assert!(should_scrobble(Duration::from_secs(4 * 60), duration));
     }
 }
