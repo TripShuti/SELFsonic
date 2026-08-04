@@ -1,6 +1,7 @@
 //! Движок відтворення: rodio `Player` + черга + gapless (попереднє декодування
 //! наступного треку) + спостереження за кінцем треку без блокування.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -179,8 +180,8 @@ pub struct Engine {
     pos: usize,
     current: Option<TrackMeta>,
 
-    /// Попередньо декодований наступний трек.
-    next_ready: Arc<Mutex<Option<Decoder>>>,
+    /// Попередньо декодований наступний трек (з id для перевірки відповідності).
+    next_ready: Arc<Mutex<Option<ReadyTrack<Decoder>>>>,
     preload_gen: Arc<AtomicUsize>,
     preload_tx: std::sync::mpsc::Sender<PreloadCmd>,
     watcher_flag: Arc<AtomicBool>,
@@ -196,11 +197,47 @@ pub struct Engine {
     queue_gen: usize,
     /// DJ-режим: черга автоматично дозаповнюється схожими треками.
     dj_enabled: bool,
+    /// «Якір» DJ — трек, що тримає тематику підбору (спершу сідо).
+    dj_anchor: Option<TrackMeta>,
+    /// Треки, додані випадковим фолбеком (не мають рухати якір).
+    dj_random_ids: HashSet<String>,
 }
 
 enum PreloadCmd {
     Decode { track: TrackMeta, gen_id: usize },
     Shutdown,
+}
+
+/// Попередньо декодований трек: id зберігаємо, щоб `take_ready` не віддав
+/// декодер чужого треку (навігація могла змінити ціль після запиту прелода).
+struct ReadyTrack<T> {
+    id: String,
+    value: T,
+}
+
+/// Рішення `take_ready` щодо пре-декодованого треку.
+#[derive(Debug)]
+enum TakeReady<T> {
+    /// Слот містив саме потрібний трек — значення вилучено.
+    Consumed(T),
+    /// Слот містив інший трек — викинуто (щоб не зіграти чужу музику).
+    Discarded(String),
+    /// Слот порожній — треба декодувати свіжо.
+    Empty,
+}
+
+/// Виймає пре-декодоване значення лише якщо воно належить треку `want_id`.
+/// Чуже значення викидається: назва поточного (`engine.current`) завжди
+/// відповідає аудіо, що грає.
+fn take_matching<T>(slot: &Mutex<Option<ReadyTrack<T>>>, want_id: &str) -> TakeReady<T> {
+    let Some(ready) = slot.lock().expect("next_ready lock").take() else {
+        return TakeReady::Empty;
+    };
+    if ready.id == want_id {
+        TakeReady::Consumed(ready.value)
+    } else {
+        TakeReady::Discarded(ready.id)
+    }
 }
 
 enum ScrobbleCmd {
@@ -256,6 +293,8 @@ impl Engine {
             track_started_at: Instant::now(),
             queue_gen: 0,
             dj_enabled: false,
+            dj_anchor: None,
+            dj_random_ids: HashSet::new(),
         };
         engine.player.set_volume(volume);
         Ok(engine)
@@ -377,6 +416,8 @@ impl Engine {
         self.queue_gen += 1;
         // Нова черга (альбом/плейліст/відновлення) завжди вимикає DJ.
         self.dj_enabled = false;
+        self.dj_anchor = None;
+        self.dj_random_ids.clear();
     }
 
     /// Лічильник змін черги (для синхронізації MPRIS TrackList).
@@ -391,6 +432,34 @@ impl Engine {
 
     pub fn dj_enabled(&self) -> bool {
         self.dj_enabled
+    }
+
+    /// Старт DJ: якір = сідо, множина random-треків чиста.
+    pub fn start_dj(&mut self, seed: TrackMeta) {
+        self.dj_enabled = true;
+        self.dj_anchor = Some(seed);
+        self.dj_random_ids.clear();
+    }
+
+    pub fn dj_anchor(&self) -> Option<&TrackMeta> {
+        self.dj_anchor.as_ref()
+    }
+
+    pub fn set_dj_anchor(&mut self, track: TrackMeta) {
+        self.dj_anchor = Some(track);
+    }
+
+    /// Позначити додані random-фолбеком треки (не стають новим якорем).
+    pub fn mark_dj_random(&mut self, ids: &[String]) {
+        self.dj_random_ids.extend(ids.iter().cloned());
+    }
+
+    pub fn unmark_dj_random(&mut self, id: &str) {
+        self.dj_random_ids.remove(id);
+    }
+
+    pub fn is_dj_random(&self, id: &str) -> bool {
+        self.dj_random_ids.contains(id)
     }
 
     /// Кількість треків у черзі після поточного (для рішення про дозаповнення).
@@ -500,13 +569,17 @@ impl Engine {
     }
 
     fn take_ready(&mut self, track: &TrackMeta) -> Option<Decoder> {
-        let mut guard = self.next_ready.lock().expect("next_ready lock");
-        match guard.take() {
-            Some(dec) => {
+        match take_matching::<Decoder>(&self.next_ready, &track.id) {
+            TakeReady::Consumed(dec) => {
                 debug!("used pre-decoded track {}", track.title);
                 Some(dec)
             }
-            None => {
+            TakeReady::Discarded(id) => {
+                debug!("discarded stale preload '{}' (wanted {})", id, track.title);
+                self.preload_gen.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            TakeReady::Empty => {
                 // Попереднє декодування могло ще йти — скасовуємо генерацію.
                 self.preload_gen.fetch_add(1, Ordering::SeqCst);
                 None
@@ -581,6 +654,8 @@ impl Engine {
     pub fn stop(&mut self) {
         self.shut_down();
         self.dj_enabled = false;
+        self.dj_anchor = None;
+        self.dj_random_ids.clear();
     }
 
     /// Внутрішня зупинка без вимкнення DJ — викликається на кінці черги
@@ -754,7 +829,7 @@ fn save_state_json(path: &Path, state: &EngineState) -> Result<()> {
 /// поки грає поточний (мережеве читання не блокує UI).
 fn spawn_preloader(
     rx: std::sync::mpsc::Receiver<PreloadCmd>,
-    next_ready: Arc<Mutex<Option<Decoder>>>,
+    next_ready: Arc<Mutex<Option<ReadyTrack<Decoder>>>>,
     preload_gen: Arc<AtomicUsize>,
     client: Arc<Client>,
 ) {
@@ -781,7 +856,10 @@ fn spawn_preloader(
                 match res {
                     Ok(dec) => {
                         if let Ok(mut guard) = next_ready.lock() {
-                            *guard = Some(dec);
+                            *guard = Some(ReadyTrack {
+                                id: track.id.clone(),
+                                value: dec,
+                            });
                         }
                     }
                     Err(e) => warn!("preload '{}': {e}", track.title),
@@ -919,5 +997,34 @@ mod tests {
         assert_eq!(scrobble_threshold(duration), Duration::from_secs(4 * 60));
         assert!(!should_scrobble(Duration::from_secs(3 * 60), duration));
         assert!(should_scrobble(Duration::from_secs(4 * 60), duration));
+    }
+
+    /// take_matching: слот із потрібним треком — віддає значення й очищує слот.
+    #[test]
+    fn take_matching_consumes_matching_track() {
+        let slot = Mutex::new(Some(ReadyTrack { id: "a".into(), value: 42 }));
+        assert!(matches!(
+            take_matching(&slot, "a"),
+            TakeReady::Consumed(42)
+        ));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    /// take_matching: чужий трек у слоті — викидається (не грає чужу музику).
+    #[test]
+    fn take_matching_discards_foreign_track() {
+        let slot = Mutex::new(Some(ReadyTrack { id: "b".into(), value: 7 }));
+        match take_matching(&slot, "a") {
+            TakeReady::Discarded(id) => assert_eq!(id, "b"),
+            other => panic!("expected Discarded, got {other:?}"),
+        }
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    /// take_matching: порожній слот — Empty, декодувати свіжо.
+    #[test]
+    fn take_matching_reports_empty_slot() {
+        let slot = Mutex::new(None::<ReadyTrack<i32>>);
+        assert!(matches!(take_matching(&slot, "a"), TakeReady::Empty));
     }
 }

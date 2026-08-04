@@ -362,9 +362,9 @@ fn handle_key(
                 engine.set_dj(false);
                 app.set_message("DJ: off", false);
             } else {
-                // Нова черга скидає DJ — стартуємо з сіда і знову вмикаємо.
-                engine.set_queue(vec![seed], 0);
-                engine.set_dj(true);
+                // Нова черга скидає DJ — стартуємо з сіда, потім ставимо якір.
+                engine.set_queue(vec![seed.clone()], 0);
+                engine.start_dj(seed);
                 app.set_message("DJ: picking similar tracks...", false);
             }
         }
@@ -372,16 +372,24 @@ fn handle_key(
     false
 }
 
-/// Одна ітерація DJ: зібрати каскад кандидатів (схожі → артист → random),
-/// відфільтрувати id з черги і додати до кінця. Порожній результат вимикає DJ.
+/// Одна ітерація DJ: каскад кандидатів із якорем (схожі → артист → random),
+/// відфільтрованих проти id з черги. Порожній результат вимикає DJ.
+/// Random-треки позначаються (не рухають якір); виграш поточної бази
+/// переміщує якір на поточний трек.
 fn refill_dj(app: &mut AppState, client: &Client, engine: &mut Engine) {
     let Some(current) = engine.current().cloned() else {
         engine.set_dj(false);
         return;
     };
     let exclude: HashSet<String> = engine.queue().iter().map(|t| t.id.clone()).collect();
-    let batch = match dj::collect(client, &current, &exclude) {
-        Ok(batch) => batch.into_iter().take(DJ_BATCH).collect::<Vec<_>>(),
+    let outcome = match dj::collect(
+        client,
+        engine.dj_anchor(),
+        &current,
+        engine.is_dj_random(&current.id),
+        &exclude,
+    ) {
+        Ok(o) => o,
         Err(e) => {
             warn!("DJ collect: {e}");
             engine.set_dj(false);
@@ -389,10 +397,24 @@ fn refill_dj(app: &mut AppState, client: &Client, engine: &mut Engine) {
             return;
         }
     };
+    let batch: Vec<TrackMeta> = outcome.tracks.into_iter().take(DJ_BATCH).collect();
     if batch.is_empty() {
         engine.set_dj(false);
         app.set_message("DJ: no more similar tracks", false);
         return;
+    }
+    match outcome.source {
+        dj::DjStep::Random => {
+            debug!("DJ refill: random +{}", batch.len());
+            let ids: Vec<String> = batch.iter().map(|t| t.id.clone()).collect();
+            engine.mark_dj_random(&ids);
+        }
+        dj::DjStep::Similar => debug!("DJ refill: similar +{}", batch.len()),
+        dj::DjStep::Artist => debug!("DJ refill: artist +{}", batch.len()),
+    }
+    if outcome.reanchor_current {
+        engine.set_dj_anchor(current.clone());
+        engine.unmark_dj_random(&current.id);
     }
     if let Some(msg) = &app.message
         && msg.text.starts_with("DJ:")
