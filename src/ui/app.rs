@@ -14,33 +14,29 @@ pub enum Tab {
     Artists,
     Albums,
     Playlists,
+    Queue,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Artists, Tab::Albums, Tab::Playlists];
+    pub const ALL: [Tab; 4] = [Tab::Artists, Tab::Albums, Tab::Playlists, Tab::Queue];
 
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Artists => "Artists",
             Tab::Albums => "Albums",
             Tab::Playlists => "Playlists",
+            Tab::Queue => "Queue",
         }
     }
 
     pub fn next(&self) -> Tab {
-        match self {
-            Tab::Artists => Tab::Albums,
-            Tab::Albums => Tab::Playlists,
-            Tab::Playlists => Tab::Artists,
-        }
+        let i = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
     pub fn prev(&self) -> Tab {
-        match self {
-            Tab::Artists => Tab::Playlists,
-            Tab::Albums => Tab::Artists,
-            Tab::Playlists => Tab::Albums,
-        }
+        let i = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 }
 
@@ -175,6 +171,14 @@ impl AppState {
         self.list.get(self.selected)
     }
 
+    /// Вибраний у списку трек (для запуску DJ клавішею `d`).
+    pub fn selected_track(&self) -> Option<TrackMeta> {
+        match self.selected_item() {
+            Some(ListItem::Track(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
     pub fn set_message(&mut self, text: impl Into<String>, is_error: bool) {
         self.message = Some(Message {
             text: text.into(),
@@ -252,8 +256,24 @@ impl AppState {
                     "Playlists",
                 );
             }
+            Tab::Queue => {
+                // Живий список наповнюється з main-циклу (engine.queue()).
+                self.set_list(Vec::new(), "Queue");
+            }
         }
         Ok(())
+    }
+
+    /// Живий список черги движка для вкладки Queue (викликається кожен тік).
+    pub fn sync_queue(&mut self, engine: &Engine) {
+        let sel = self.selected;
+        self.list = engine.queue().iter().cloned().map(ListItem::Track).collect();
+        self.list_title = format!("Queue ({})", self.list.len());
+        if self.list.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = sel.min(self.list.len() - 1);
+        }
     }
 
     pub fn load_albums_from_cache(&mut self, db: &mut Db) -> Result<()> {
@@ -291,7 +311,7 @@ impl AppState {
         self.clear_message();
         match item {
             ListItem::Artist { id, name, .. } => self.open_artist(client, db, &id, &name),
-            ListItem::Album { id, .. } => self.play_album(client, db, engine, &id),
+            ListItem::Album { id, name, .. } => self.open_album(client, db, &id, &name),
             ListItem::Track(t) => {
                 // Відтворити вибраний трек у межах поточного контексту.
                 let start = self
@@ -302,7 +322,7 @@ impl AppState {
                 self.queue_and_play(engine, self.ctx_tracks.clone(), start);
                 Ok(())
             }
-            ListItem::Playlist { id, name, .. } => self.open_playlist(client, db, engine, &id, &name),
+            ListItem::Playlist { id, name, .. } => self.open_playlist(client, db, &id, &name),
             ListItem::More => self.load_more_albums(client, db),
         }
     }
@@ -321,7 +341,8 @@ impl AppState {
         Ok(())
     }
 
-    fn play_album(&mut self, client: &Client, db: &mut Db, engine: &mut Engine, id: &str) -> Result<()> {
+    /// Відкрити альбом: показати треки (без відтворення — реалізується Enter на треці).
+    fn open_album(&mut self, client: &Client, db: &mut Db, id: &str, name: &str) -> Result<()> {
         let tracks = db.tracks_by_album(id)?;
         let tracks = if tracks.is_empty() {
             let album = client.get_album(id)?;
@@ -331,9 +352,9 @@ impl AppState {
         } else {
             tracks
         };
-        let metas: Vec<TrackMeta> = tracks.iter().map(TrackMeta::from).collect();
-        self.ctx_tracks = metas.clone();
-        self.queue_and_play(engine, metas, 0);
+        self.ctx_tracks = tracks.iter().map(TrackMeta::from).collect();
+        self.push_level();
+        self.set_list(tracks.iter().map(items_from_track).collect(), name);
         Ok(())
     }
 
@@ -341,7 +362,6 @@ impl AppState {
         &mut self,
         client: &Client,
         db: &mut Db,
-        engine: &mut Engine,
         id: &str,
         name: &str,
     ) -> Result<()> {
@@ -353,11 +373,10 @@ impl AppState {
         } else {
             tracks
         };
-        let metas: Vec<TrackMeta> = tracks.iter().map(TrackMeta::from).collect();
-        self.ctx_tracks = metas.clone();
+        // Відкриваємо список треків плейліста; відтворення — Enter на треку.
+        self.ctx_tracks = tracks.iter().map(TrackMeta::from).collect();
         self.push_level();
         self.set_list(tracks.iter().map(items_from_track).collect(), name);
-        self.queue_and_play(engine, metas, 0);
         Ok(())
     }
 

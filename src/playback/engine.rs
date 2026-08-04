@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::api::client::{Client, StreamFile};
+use crate::api::models::Child;
 use crate::cache::db::CachedTrack;
 use crate::error::{AppError, Result};
 
@@ -60,6 +61,22 @@ impl From<&CachedTrack> for TrackMeta {
             duration: t.duration,
             track_number: t.track_number,
             disc_number: t.disc_number,
+        }
+    }
+}
+
+impl From<&Child> for TrackMeta {
+    fn from(c: &Child) -> Self {
+        Self {
+            id: c.id.clone(),
+            title: c.title.clone().unwrap_or_default(),
+            artist: c.artist.clone().unwrap_or_default(),
+            album: c.album.clone().unwrap_or_default(),
+            album_id: c.album_id.clone().unwrap_or_default(),
+            cover_art: c.cover_art.clone(),
+            duration: c.duration.unwrap_or(0),
+            track_number: c.track,
+            disc_number: c.disc_number,
         }
     }
 }
@@ -177,6 +194,8 @@ pub struct Engine {
     track_started_at: Instant,
     /// Лічильник змін черги (для MPRIS TrackList).
     queue_gen: usize,
+    /// DJ-режим: черга автоматично дозаповнюється схожими треками.
+    dj_enabled: bool,
 }
 
 enum PreloadCmd {
@@ -236,6 +255,7 @@ impl Engine {
             scrobbled: false,
             track_started_at: Instant::now(),
             queue_gen: 0,
+            dj_enabled: false,
         };
         engine.player.set_volume(volume);
         Ok(engine)
@@ -355,11 +375,62 @@ impl Engine {
         self.current = None;
         self.preload_gen.fetch_add(1, Ordering::SeqCst);
         self.queue_gen += 1;
+        // Нова черга (альбом/плейліст/відновлення) завжди вимикає DJ.
+        self.dj_enabled = false;
     }
 
     /// Лічильник змін черги (для синхронізації MPRIS TrackList).
     pub fn queue_gen(&self) -> usize {
         self.queue_gen
+    }
+
+    /// DJ-режим: черга дозаповнюється схожими треками (викликається з UI-циклу).
+    pub fn set_dj(&mut self, enabled: bool) {
+        self.dj_enabled = enabled;
+    }
+
+    pub fn dj_enabled(&self) -> bool {
+        self.dj_enabled
+    }
+
+    /// Кількість треків у черзі після поточного (для рішення про дозаповнення).
+    pub fn queue_remaining(&self) -> usize {
+        self.order
+            .len()
+            .saturating_sub((self.pos + 1).min(self.order.len()))
+    }
+
+    /// Додає треки в кінець черги (DJ-дозаповнення) без скидання відтворення.
+    /// Якщо движок був зупинений на вичерпаній черзі — відновлює відтворення
+    /// з першого доданого треку. Нові треки в shuffle перемішуються між собою.
+    pub fn append_tracks(&mut self, mut tracks: Vec<TrackMeta>) {
+        if tracks.is_empty() {
+            return;
+        }
+        if self.shuffle {
+            tracks.shuffle(&mut rand::rng());
+        }
+        let base = self.queue.len();
+        self.queue.extend(tracks);
+        if self.order.is_empty() {
+            self.order = (0..self.queue.len()).collect();
+        } else {
+            self.order.extend(base..self.queue.len());
+        }
+        self.preload_gen.fetch_add(1, Ordering::SeqCst);
+        self.queue_gen += 1;
+        if self.stopped && self.current.is_none() {
+            // Черга була вичерпана — стартуємо з першого доданого треку.
+            self.stopped = false;
+            let idx = if self.pos + 1 < self.order.len() {
+                self.pos + 1
+            } else {
+                self.pos
+            };
+            self.play_track_at(idx);
+        } else {
+            self.request_preload();
+        }
     }
 
     fn rebuild_order(&mut self) {
@@ -472,6 +543,10 @@ impl Engine {
         if next < self.order.len() {
             return self.queue.get(self.order[next]).cloned();
         }
+        // У DJ-режимі кінець черги не зациклюється — дозаповнення відновить її сам.
+        if self.dj_enabled {
+            return None;
+        }
         match self.loop_mode {
             LoopMode::Track => self.queue.get(self.order[self.pos]).cloned(),
             LoopMode::Playlist => self.queue.get(self.order[0]).cloned(),
@@ -502,7 +577,15 @@ impl Engine {
         }
     }
 
+    /// Повна зупинка відтворення (також вимикає DJ).
     pub fn stop(&mut self) {
+        self.shut_down();
+        self.dj_enabled = false;
+    }
+
+    /// Внутрішня зупинка без вимкнення DJ — викликається на кінці черги
+    /// у DJ-режимі: черга ще має бути дозаповнена і відтворення відновлено.
+    fn shut_down(&mut self) {
         self.stopped = true;
         self.current = None;
         self.player.stop();
@@ -606,6 +689,16 @@ impl Engine {
                 EngineEvent::TrackEnded => {
                     out.push(EngineEvent::TrackEnded);
                     if self.stopped {
+                        continue;
+                    }
+                    if self.dj_enabled {
+                        // DJ не повторює поточний трек (ігнорує LoopMode::Track)
+                        // і не зациклює чергу — на кінці чекає дозаповнення.
+                        if self.pos + 1 < self.order.len() {
+                            self.play_track_at(self.pos + 1);
+                        } else {
+                            self.shut_down();
+                        }
                         continue;
                     }
                     match self.loop_mode {

@@ -9,6 +9,7 @@ mod error;
 mod playback;
 mod ui;
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,12 +27,16 @@ use crate::api::client::Client;
 use crate::cache::db::Db;
 use crate::config::{Config, cache_dir, state_dir};
 use crate::error::AppError;
+use crate::playback::dj::{self, DJ_BATCH, DJ_REFILL_AT};
 use crate::playback::engine::{Engine, EngineEvent, EngineState, LoopMode, TrackMeta};
 use crate::playback::mpris::{self, Mpris, MprisUpdate, PlayerCommand};
 use crate::ui::app::{AppState, Tab};
 use crate::ui::keybindings::Action;
 
 const TICK: Duration = Duration::from_millis(50);
+
+/// Мінімальний інтервал між DJ-дозаповненнями (захист від частих порожніх спроб).
+const DJ_REFILL_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let config_path = parse_args()?;
@@ -216,9 +221,14 @@ fn run_tui(
     ui::theme::init();
     let mut terminal = ratatui::init();
     let mut quit = false;
+    let mut last_dj_refill: Option<Instant> = None;
 
     let result: Result<()> = (|| {
         while !quit {
+            // Жива черга для вкладки Queue (DJ дозаповнює її в ре-таймі).
+            if app.tab == Tab::Queue {
+                app.sync_queue(engine);
+            }
             terminal
                 .draw(|f| draw(f, app, engine))
                 .context("drawing")?;
@@ -243,6 +253,19 @@ fn run_tui(
             }
             engine.maybe_scrobble();
             refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
+
+            // DJ: синхронне дозаповнення черги, коли вона на межі вичерпання.
+            // Тротлінг інтервалом захищає від частих порожніх спроб.
+            let dj_due = engine.dj_enabled()
+                && engine.queue_remaining() < DJ_REFILL_AT
+                && match last_dj_refill {
+                    Some(t) => t.elapsed() >= DJ_REFILL_MIN_INTERVAL,
+                    None => true,
+                };
+            if dj_due {
+                last_dj_refill = Some(Instant::now());
+                refill_dj(app, client, engine);
+            }
 
             // Авто-підвантаження наступної сторінки альбомів.
             if app.tab == Tab::Albums
@@ -298,7 +321,12 @@ fn handle_key(
             }
         }
         Action::Select => {
-            if let Err(e) = app.select_current(client, db, engine) {
+            if app.tab == Tab::Queue {
+                // У черзі Enter перемикає відтворення на вибраний трек.
+                if app.selected < engine.queue().len() {
+                    engine.play_index(app.selected);
+                }
+            } else if let Err(e) = app.select_current(client, db, engine) {
                 app.set_message(format!("{e}"), true);
                 warn!("select: {e}");
             }
@@ -321,8 +349,57 @@ fn handle_key(
                 warn!("refresh: {e}");
             }
         }
+        Action::DJ => {
+            let seed = match (app.selected_track(), engine.current().cloned()) {
+                (Some(t), _) => t,
+                (None, Some(t)) => t,
+                (None, None) => {
+                    app.set_message("DJ: select a track first (d)", true);
+                    return false;
+                }
+            };
+            if engine.dj_enabled() {
+                engine.set_dj(false);
+                app.set_message("DJ: off", false);
+            } else {
+                // Нова черга скидає DJ — стартуємо з сіда і знову вмикаємо.
+                engine.set_queue(vec![seed], 0);
+                engine.set_dj(true);
+                app.set_message("DJ: picking similar tracks...", false);
+            }
+        }
     }
     false
+}
+
+/// Одна ітерація DJ: зібрати каскад кандидатів (схожі → артист → random),
+/// відфільтрувати id з черги і додати до кінця. Порожній результат вимикає DJ.
+fn refill_dj(app: &mut AppState, client: &Client, engine: &mut Engine) {
+    let Some(current) = engine.current().cloned() else {
+        engine.set_dj(false);
+        return;
+    };
+    let exclude: HashSet<String> = engine.queue().iter().map(|t| t.id.clone()).collect();
+    let batch = match dj::collect(client, &current, &exclude) {
+        Ok(batch) => batch.into_iter().take(DJ_BATCH).collect::<Vec<_>>(),
+        Err(e) => {
+            warn!("DJ collect: {e}");
+            engine.set_dj(false);
+            app.set_message(format!("DJ: {e}"), true);
+            return;
+        }
+    };
+    if batch.is_empty() {
+        engine.set_dj(false);
+        app.set_message("DJ: no more similar tracks", false);
+        return;
+    }
+    if let Some(msg) = &app.message
+        && msg.text.starts_with("DJ:")
+    {
+        app.clear_message();
+    }
+    engine.append_tracks(batch);
 }
 
 // ---------- MPRIS: команди та оновлення ----------
@@ -559,7 +636,7 @@ fn draw(frame: &mut Frame, app: &AppState, engine: &Engine) {
     let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(4),
+        Constraint::Length(6),
     ])
     .split(frame.area());
 
@@ -579,6 +656,7 @@ fn draw(frame: &mut Frame, app: &AppState, engine: &Engine) {
         Tab::Artists => ui::views::artists::render(frame, areas[1], app),
         Tab::Albums => ui::views::albums::render(frame, areas[1], app),
         Tab::Playlists => ui::views::tracks::render(frame, areas[1], app),
+        Tab::Queue => ui::views::queue::render(frame, areas[1], app, engine),
     }
     ui::views::now_playing::render(frame, areas[2], engine, app);
 }

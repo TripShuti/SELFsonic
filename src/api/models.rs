@@ -235,6 +235,45 @@ pub struct PlaylistWithSongs {
     pub entry: Vec<Child>,
 }
 
+// ---------- getSimilarSongs / getRandomSongs / search3 ----------
+
+/// Список пісень-відповідь `{ "song": [Child, ...] }`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SongList {
+    #[serde(default)]
+    pub song: Vec<Child>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarSongsPayload {
+    pub similar_songs: SongList,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RandomSongsPayload {
+    pub random_songs: SongList,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult3Payload {
+    pub search_result_3: SearchResult3,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult3 {
+    #[serde(default)]
+    pub song: Vec<Child>,
+    #[serde(default)]
+    pub album: Vec<AlbumId3>,
+    #[serde(default)]
+    pub artist: Vec<ArtistId3>,
+}
+
 // ---------- scrobble (відповідь без payload) ----------
 
 /// Відповідь без корисного навантаження: scrobble повертає лише `status`.
@@ -289,6 +328,74 @@ mod tests {
         let resp: SubsonicResponse<EmptyPayload> = serde_json::from_str(json).unwrap();
         assert_eq!(resp.response.status, "ok");
         assert!(resp.response.data.is_some());
+    }
+
+    #[test]
+    fn parse_similar_songs_ok() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "similarSongs": {
+              "song": [ { "id": "s1", "title": "T1", "artist": "A1", "album": "B1", "duration": 200 } ]
+            }
+          }
+        }"#;
+        let resp: SubsonicResponse<SimilarSongsPayload> = serde_json::from_str(json).unwrap();
+        let songs = resp.response.data.unwrap().similar_songs.song;
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].id, "s1");
+        assert_eq!(songs[0].duration, Some(200));
+    }
+
+    /// Navidrome повертає порожній `"similarSongs": {}` — десеріалізується у пустий список.
+    #[test]
+    fn parse_similar_songs_empty() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "similarSongs": {}
+          }
+        }"#;
+        let resp: SubsonicResponse<SimilarSongsPayload> = serde_json::from_str(json).unwrap();
+        let songs = resp.response.data.unwrap().similar_songs.song;
+        assert!(songs.is_empty());
+    }
+
+    #[test]
+    fn parse_random_songs() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "randomSongs": {
+              "song": [ { "id": "r1" }, { "id": "r2" } ]
+            }
+          }
+        }"#;
+        let resp: SubsonicResponse<RandomSongsPayload> = serde_json::from_str(json).unwrap();
+        let songs = resp.response.data.unwrap().random_songs.song;
+        assert_eq!(songs.len(), 2);
+    }
+
+    #[test]
+    fn parse_search_result3() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "searchResult3": {
+              "song": [ { "id": "p1", "title": "Song" } ],
+              "album": [],
+              "artist": []
+            }
+          }
+        }"#;
+        let resp: SubsonicResponse<SearchResult3Payload> = serde_json::from_str(json).unwrap();
+        let songs = resp.response.data.unwrap().search_result_3.song;
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title.as_deref(), Some("Song"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod albums;
 pub mod artists;
 pub mod now_playing;
+pub mod queue;
 pub mod tracks;
 
 use ratatui::layout::Rect;
@@ -14,11 +15,7 @@ use ratatui::Frame;
 use super::app::{ListItem, list_row_style};
 use super::theme;
 
-pub fn row_items(items: &[ListItem]) -> Vec<TuiListItem<'static>> {
-    items.iter().map(row_item).collect()
-}
-
-fn row_item(item: &ListItem) -> TuiListItem<'static> {
+pub fn row_item(item: &ListItem) -> TuiListItem<'static> {
     let line = match item {
         ListItem::Artist { name, album_count, .. } => Line::from(vec![
             Span::raw(name.clone()),
@@ -88,7 +85,24 @@ pub fn render_list(
     items: &[ListItem],
     selected: usize,
 ) {
-    let list = List::new(row_items(items))
+    render_list_rows(frame, area, title, items, selected, |item| {
+        row_item(item)
+    });
+}
+
+/// Те саме, що `render_list`, але з кастомними рядками (вкладка Queue
+/// позначає поточний трек).
+pub fn render_list_rows<F>(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: &[ListItem],
+    selected: usize,
+    build: F,
+) where
+    F: Fn(&ListItem) -> TuiListItem<'static>,
+{
+    let list = List::new(items.iter().map(&build))
         .block(Block::bordered().title(title).border_style(theme::border()))
         .highlight_style(list_row_style(true))
         .highlight_symbol("> ")

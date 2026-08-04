@@ -198,6 +198,38 @@ impl Client {
         self.url("getCoverArt", &[("id", cover_art.to_string())])
     }
 
+    /// Схожі пісні (Last.fm, per-track). Navidrome ігнорує `count < 14` і
+    /// повертає порожньо — завжди питаємо `count >= 14`. Джерело для DJ.
+    pub fn get_similar_songs(&self, id: &str, count: u32) -> Result<Vec<Child>> {
+        let payload: SimilarSongsPayload = self.call(
+            "getSimilarSongs",
+            &[("id", id.to_string()), ("count", count.to_string())],
+        )?;
+        Ok(payload.similar_songs.song)
+    }
+
+    /// Пошук пісень по імені артиста (DJ-фолбек «пісні того ж артиста»,
+    /// бо `getAlbumList2 type=byArtist` у Navidrome не реалізовано).
+    pub fn search3_songs(&self, query: &str, count: u32) -> Result<Vec<Child>> {
+        let payload: SearchResult3Payload = self.call(
+            "search3",
+            &[
+                ("query", query.to_string()),
+                ("songCount", count.to_string()),
+                ("albumCount", "0".into()),
+                ("artistCount", "0".into()),
+            ],
+        )?;
+        Ok(payload.search_result_3.song)
+    }
+
+    /// Випадкові пісні (DJ-фолбек, коли схожих і пісень артиста немає).
+    pub fn get_random_songs(&self, size: u32) -> Result<Vec<Child>> {
+        let payload: RandomSongsPayload =
+            self.call("getRandomSongs", &[("size", size.to_string())])?;
+        Ok(payload.random_songs.song)
+    }
+
     /// Відкриває аудіо-стрім: downloader-потік пише в тимчасовий файл,
     /// `StreamFile` блокує читання, поки дані не дійдуть (не в пам'яті).
     pub fn stream(&self, track_id: &str) -> Result<Stream> {
