@@ -263,6 +263,17 @@ pub struct SearchResult3Payload {
     pub search_result_3: SearchResult3,
 }
 
+// ---------- getStarred2 ----------
+
+/// Відповідь `getStarred2`: `{ "starred2": { "song": [...] } }` — пісні,
+/// які зазірочені на сервері (Subsonic-еквівалент «favorites»).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Starred2Payload {
+    #[serde(default)]
+    pub starred2: SongList,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult3 {
@@ -396,6 +407,38 @@ mod tests {
         let songs = resp.response.data.unwrap().search_result_3.song;
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0].title.as_deref(), Some("Song"));
+    }
+
+    #[test]
+    fn parse_starred2() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "starred2": {
+              "song": [ { "id": "f1", "title": "Fav", "artist": "A1", "album": "B1", "duration": 180 } ]
+            }
+          }
+        }"#;
+        let resp: SubsonicResponse<Starred2Payload> = serde_json::from_str(json).unwrap();
+        let songs = resp.response.data.unwrap().starred2.song;
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].id, "f1");
+        assert_eq!(songs[0].title.as_deref(), Some("Fav"));
+    }
+
+    /// Navidrome повертає порожній `"starred2": {}` — десеріалізується у пустий список.
+    #[test]
+    fn parse_starred2_empty() {
+        let json = r#"{
+          "subsonic-response": {
+            "status": "ok",
+            "version": "1.16.1",
+            "starred2": {}
+          }
+        }"#;
+        let resp: SubsonicResponse<Starred2Payload> = serde_json::from_str(json).unwrap();
+        assert!(resp.response.data.unwrap().starred2.song.is_empty());
     }
 
     #[test]

@@ -14,19 +14,33 @@ use super::{fmt_duration, render_list_rows};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &AppState, engine: &Engine) {
     let current_id = engine.current().map(|t| t.id.clone());
+    let starred = &app.starred_ids;
     render_list_rows(frame, area, &app.list_title, &app.list, app.selected, |item| {
-        queue_row(item, &current_id)
+        queue_row(item, &current_id, starred)
     });
 }
 
-fn queue_row(item: &ListItem, current_id: &Option<String>) -> TuiListItem<'static> {
+fn queue_row(
+    item: &ListItem,
+    current_id: &Option<String>,
+    starred: &std::collections::HashSet<String>,
+) -> TuiListItem<'static> {
     let ListItem::Track(t) = item else {
         return TuiListItem::new(Line::raw(""));
     };
     let is_current = Some(&t.id) == current_id.as_ref();
+    let is_starred = starred.contains(&t.id);
     let style = if is_current { theme::green() } else { theme::fg() };
     let mut spans = vec![
         Span::styled(if is_current { "* " } else { "  " }, style),
+        Span::styled(
+            if is_starred {
+                format!("{} ", super::HEART)
+            } else {
+                "  ".to_string()
+            },
+            theme::red(),
+        ),
         Span::styled(t.title.clone(), style),
     ];
     if !t.artist.is_empty() {

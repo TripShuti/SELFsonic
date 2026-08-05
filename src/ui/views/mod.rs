@@ -12,10 +12,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem as TuiListItem, ListState};
 use ratatui::Frame;
 
+use std::collections::HashSet;
+
 use super::app::{ListItem, list_row_style};
 use super::theme;
 
-pub fn row_item(item: &ListItem) -> TuiListItem<'static> {
+/// Позначка «у favorites» — єдиний дозволений символьний значок (AGENT.md).
+pub const HEART: &str = "\u{2665}";
+
+pub fn row_item(item: &ListItem, starred: &HashSet<String>) -> TuiListItem<'static> {
     let line = match item {
         ListItem::Artist { name, album_count, .. } => Line::from(vec![
             Span::raw(name.clone()),
@@ -42,11 +47,16 @@ pub fn row_item(item: &ListItem) -> TuiListItem<'static> {
             Line::from(spans)
         }
         ListItem::Track(t) => {
+            let is_starred = starred.contains(&t.id);
             let num = t
                 .track_number
                 .map(|n| format!("{n:>2}. "))
                 .unwrap_or_default();
             let mut spans = vec![
+                Span::styled(
+                    if is_starred { format!("{HEART} ") } else { "  ".to_string() },
+                    theme::red(),
+                ),
                 Span::styled(num, theme::fg_dim()),
                 Span::styled(t.title.clone(), theme::fg()),
             ];
@@ -84,9 +94,10 @@ pub fn render_list(
     title: &str,
     items: &[ListItem],
     selected: usize,
+    starred: &HashSet<String>,
 ) {
     render_list_rows(frame, area, title, items, selected, |item| {
-        row_item(item)
+        row_item(item, starred)
     });
 }
 

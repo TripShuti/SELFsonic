@@ -24,6 +24,7 @@ pub enum Action {
     SeekForward,
     SeekBackward,
     Refresh,
+    ToggleFavorite,
     DJ,
     Quit,
 }
@@ -55,6 +56,7 @@ impl Action {
             KeyCode::Char(']') => Some(Action::SeekForward),
             KeyCode::Char('[') => Some(Action::SeekBackward),
             KeyCode::Char('r') => Some(Action::Refresh),
+            KeyCode::Char('f') => Some(Action::ToggleFavorite),
             KeyCode::Char('d') => Some(Action::DJ),
             KeyCode::Tab => Some(Action::NextTab),
             KeyCode::BackTab => Some(Action::PrevTab),
@@ -81,6 +83,10 @@ mod tests {
         assert_eq!(Action::from_key(key(KeyCode::Char('G'))), Some(Action::Bottom));
         assert_eq!(Action::from_key(key(KeyCode::Char(' '))), Some(Action::PlayPause));
         assert_eq!(Action::from_key(key(KeyCode::Char('d'))), Some(Action::DJ));
+        assert_eq!(
+            Action::from_key(key(KeyCode::Char('f'))),
+            Some(Action::ToggleFavorite)
+        );
         // Ctrl+d — це PageDown, а не DJ.
         assert_eq!(
             Action::from_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),

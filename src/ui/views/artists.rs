@@ -12,7 +12,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &AppState) {
         render_empty(frame, area, "Library is empty — press r to refresh");
         return;
     }
-    render_list(frame, area, &app.list_title, &app.list, app.selected);
+    render_list(
+        frame,
+        area,
+        &app.list_title,
+        &app.list,
+        app.selected,
+        &app.starred_ids,
+    );
 }
 
 fn render_empty(frame: &mut Frame, area: Rect, msg: &str) {

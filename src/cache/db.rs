@@ -93,6 +93,18 @@ impl Db {
                 track_id    TEXT NOT NULL,
                 PRIMARY KEY (playlist_id, position)
             );
+            CREATE TABLE IF NOT EXISTS starred (
+                id           TEXT PRIMARY KEY,
+                title        TEXT NOT NULL,
+                album        TEXT NOT NULL DEFAULT '',
+                album_id     TEXT NOT NULL DEFAULT '',
+                artist       TEXT NOT NULL DEFAULT '',
+                cover_art    TEXT,
+                duration     INTEGER NOT NULL DEFAULT 0,
+                track_number INTEGER,
+                disc_number  INTEGER,
+                starred_at   REAL NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
             CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
             CREATE INDEX IF NOT EXISTS idx_playlist_tracks_id ON playlist_tracks(playlist_id);",
@@ -105,6 +117,14 @@ impl Db {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    /// Момент з мілісекундною точністю (порядок «свіжіші зверху» у Favorites).
+    fn now_f64() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
     }
 
     // ---------- artists ----------
@@ -446,6 +466,114 @@ impl Db {
         let rows = stmt.query_map([playlist_id], map_track)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    // ---------- starred (favorites) ----------
+
+    /// Додати трек у favorites. Самостійна таблиця з повним метадата — вкладка
+    /// працює, навіть якщо трек ще не закешований серед альбомів/плейлистів.
+    pub fn star_track(&mut self, t: &Child) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO starred (id, title, album, album_id, artist, cover_art, duration, track_number, disc_number, starred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title        = excluded.title,
+                   album        = excluded.album,
+                   album_id     = excluded.album_id,
+                   artist       = excluded.artist,
+                   cover_art    = COALESCE(excluded.cover_art, starred.cover_art),
+                   duration     = COALESCE(excluded.duration, starred.duration),
+                   track_number = COALESCE(excluded.track_number, starred.track_number),
+                   disc_number  = COALESCE(excluded.disc_number, starred.disc_number),
+                   starred_at   = excluded.starred_at",
+                rusqlite::params![
+                    t.id,
+                    t.title.clone().unwrap_or_default(),
+                    t.album.clone().unwrap_or_default(),
+                    t.album_id.clone().unwrap_or_default(),
+                    t.artist.clone().unwrap_or_default(),
+                    t.cover_art.clone(),
+                    t.duration.unwrap_or(0),
+                    t.track,
+                    t.disc_number,
+                    Self::now_f64()
+                ],
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Прибрати трек з favorites.
+    pub fn unstar_track(&mut self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM starred WHERE id = ?1", [id])
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Всі зазірочені треки, найсвіжіші зверху.
+    pub fn starred_tracks(&self) -> Result<Vec<CachedTrack>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, album, album_id, artist, cover_art, duration, track_number, disc_number
+             FROM starred ORDER BY starred_at DESC",
+        )?;
+        let rows = stmt.query_map([], map_track)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// id всіх зазірочених треків.
+    pub fn starred_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM starred")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Синк з сервером: `getStarred2` повертає повний список — upsert свіжих
+    /// і видалення тих, яких на сервері більше немає.
+    pub fn sync_starred(&mut self, starred: &[Child]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO starred (id, title, album, album_id, artist, cover_art, duration, track_number, disc_number, starred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title        = excluded.title,
+                   album        = excluded.album,
+                   album_id     = excluded.album_id,
+                   artist       = excluded.artist,
+                   cover_art    = COALESCE(excluded.cover_art, starred.cover_art),
+                   duration     = COALESCE(excluded.duration, starred.duration),
+                   track_number = COALESCE(excluded.track_number, starred.track_number),
+                   disc_number  = COALESCE(excluded.disc_number, starred.disc_number),
+                   starred_at   = excluded.starred_at",
+            )?;
+            for t in starred {
+                stmt.execute(rusqlite::params![
+                    t.id,
+                    t.title.clone().unwrap_or_default(),
+                    t.album.clone().unwrap_or_default(),
+                    t.album_id.clone().unwrap_or_default(),
+                    t.artist.clone().unwrap_or_default(),
+                    t.cover_art.clone(),
+                    t.duration.unwrap_or(0),
+                    t.track,
+                    t.disc_number,
+                    Self::now_f64()
+                ])?;
+            }
+        }
+        if starred.is_empty() {
+            tx.execute("DELETE FROM starred", [])?;
+        } else {
+            let placeholders = vec!["?"; starred.len()].join(",");
+            tx.execute(
+                &format!("DELETE FROM starred WHERE id NOT IN ({placeholders})"),
+                rusqlite::params_from_iter(starred.iter().map(|t| &t.id)),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn map_album(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedAlbum> {
@@ -672,6 +800,73 @@ mod tests {
 
         let restored = db.tracks_by_ids(&["t1".to_string()]).unwrap();
         assert_eq!(restored[0].id, "t1");
+    }
+
+    /// star/unstar roundtrip + ordering (свіжіші зверху).
+    #[test]
+    fn star_unstar_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        let t = |id: &str, title: &str| Child {
+            id: id.into(),
+            title: Some(title.into()),
+            album: Some("Album".into()),
+            album_id: Some("al1".into()),
+            artist: Some("Artist".into()),
+            duration: Some(240),
+            track: Some(1),
+            ..Default::default()
+        };
+
+        db.star_track(&t("t1", "First")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.star_track(&t("t2", "Second")).unwrap();
+
+        let ids = db.starred_ids().unwrap();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+
+        // Свіжіший (t2) зверху.
+        let tracks = db.starred_tracks().unwrap();
+        assert_eq!(tracks[0].id, "t2");
+        assert_eq!(tracks[0].title, "Second");
+        assert_eq!(tracks.len(), 2);
+
+        db.unstar_track("t1").unwrap();
+        let tracks = db.starred_tracks().unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "t2");
+        assert!(!db.starred_ids().unwrap().contains(&"t1".to_string()));
+    }
+
+    /// sync_starred: upsert свіжих + prune тих, яких на сервері більше немає.
+    #[test]
+    fn sync_starred_upserts_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        db.star_track(&Child {
+            id: "gone".into(),
+            title: Some("Gone".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let fresh = vec![Child {
+            id: "keep".into(),
+            title: Some("Keep".into()),
+            artist: Some("Artist".into()),
+            duration: Some(200),
+            ..Default::default()
+        }];
+        db.sync_starred(&fresh).unwrap();
+
+        let ids = db.starred_ids().unwrap();
+        assert_eq!(ids, vec!["keep".to_string()]);
+        assert_eq!(db.starred_tracks().unwrap()[0].artist, "Artist");
+
+        db.sync_starred(&[]).unwrap();
+        assert!(db.starred_ids().unwrap().is_empty());
     }
 
     #[test]

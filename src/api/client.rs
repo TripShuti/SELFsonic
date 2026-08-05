@@ -198,6 +198,26 @@ impl Client {
         self.url("getCoverArt", &[("id", cover_art.to_string())])
     }
 
+    /// Зазірочені пісні (Subsonic-еквівалент «favorites»).
+    pub fn get_starred2(&self) -> Result<Vec<Child>> {
+        let payload: Starred2Payload = self.call("getStarred2", &[])?;
+        Ok(payload.starred2.song)
+    }
+
+    /// Додати трек у «favorites» (`star`). Navidrome приймає GET-параметри;
+    /// старі сервери (Airsonic) теж. Якщо сервер вимагатиме POST form-data
+    /// (спека Subsonic 1.15+) — перейти на `send_form`.
+    pub fn star(&self, id: &str) -> Result<()> {
+        let _: EmptyPayload = self.call("star", &[("id", id.to_string())])?;
+        Ok(())
+    }
+
+    /// Прибрати трек з «favorites» (`unstar`).
+    pub fn unstar(&self, id: &str) -> Result<()> {
+        let _: EmptyPayload = self.call("unstar", &[("id", id.to_string())])?;
+        Ok(())
+    }
+
     /// Схожі пісні (Last.fm, per-track). Navidrome ігнорує `count < 14` і
     /// повертає порожньо — завжди питаємо `count >= 14`. Джерело для DJ.
     pub fn get_similar_songs(&self, id: &str, count: u32) -> Result<Vec<Child>> {

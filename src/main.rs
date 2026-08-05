@@ -94,6 +94,19 @@ fn main() -> Result<()> {
     if let Err(e) = app.load_current_tab_from_cache(&mut db) {
         warn!("cache empty/corrupted: {e}");
     }
+    // Favorites синкаються з сервером на старті (далі — тільки ручний `r`,
+    // без polling). Падіння не критичне — старі клієнти просто побачать
+    // порожній список до першого refresh.
+    if let Err(e) = (|| -> Result<()> {
+        let starred = client.get_starred2()?;
+        db.sync_starred(&starred)?;
+        Ok(())
+    })() {
+        warn!("initial starred sync failed: {e}");
+    }
+    if let Err(e) = app.refresh_starred(&db) {
+        warn!("starred cache read failed: {e}");
+    }
     if db.artists().map(|a| a.is_empty()).unwrap_or(true) {
         warn!("library empty, first refresh");
         if let Err(e) = app.refresh(&client, &mut db) {
@@ -347,6 +360,17 @@ fn handle_key(
         Action::Refresh => {
             if let Err(e) = app.refresh(client, db) {
                 warn!("refresh: {e}");
+            }
+        }
+        Action::ToggleFavorite => {
+            match app.toggle_favorite(client, db) {
+                Ok(Some(true)) => app.set_message("Starred ♥", false),
+                Ok(Some(false)) => app.set_message("Unstarred", false),
+                Ok(None) => {}
+                Err(e) => {
+                    app.set_message(format!("Favorite: {e}"), true);
+                    warn!("toggle favorite: {e}");
+                }
             }
         }
         Action::DJ => {
@@ -678,6 +702,7 @@ fn draw(frame: &mut Frame, app: &AppState, engine: &Engine) {
         Tab::Artists => ui::views::artists::render(frame, areas[1], app),
         Tab::Albums => ui::views::albums::render(frame, areas[1], app),
         Tab::Playlists => ui::views::tracks::render(frame, areas[1], app),
+        Tab::Favorites => ui::views::tracks::render(frame, areas[1], app),
         Tab::Queue => ui::views::queue::render(frame, areas[1], app, engine),
     }
     ui::views::now_playing::render(frame, areas[2], engine, app);

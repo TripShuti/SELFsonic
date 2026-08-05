@@ -14,17 +14,25 @@ pub enum Tab {
     Artists,
     Albums,
     Playlists,
+    Favorites,
     Queue,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Artists, Tab::Albums, Tab::Playlists, Tab::Queue];
+    pub const ALL: [Tab; 5] = [
+        Tab::Artists,
+        Tab::Albums,
+        Tab::Playlists,
+        Tab::Favorites,
+        Tab::Queue,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Artists => "Artists",
             Tab::Albums => "Albums",
             Tab::Playlists => "Playlists",
+            Tab::Favorites => "Favorites",
             Tab::Queue => "Queue",
         }
     }
@@ -79,6 +87,8 @@ pub struct AppState {
     pub message: Option<Message>,
     /// Context tracks of the current level (for Enter playback).
     ctx_tracks: Vec<TrackMeta>,
+    /// Id зазірочених треків (для позначки ♥ у списках).
+    pub starred_ids: std::collections::HashSet<String>,
     /// Pagination of the Albums tab.
     pub albums_offset: usize,
     pub albums_exhausted: bool,
@@ -101,6 +111,7 @@ impl AppState {
             loading: false,
             message: None,
             ctx_tracks: Vec::new(),
+            starred_ids: std::collections::HashSet::new(),
             albums_offset: 0,
             albums_exhausted: false,
         }
@@ -210,6 +221,9 @@ impl AppState {
             let playlist_ids: Vec<String> = playlists.iter().map(|p| p.id.clone()).collect();
             db.prune_playlists(&playlist_ids)?;
             db.prune_orphan_tracks()?;
+            let starred = client.get_starred2()?;
+            db.sync_starred(&starred)?;
+            self.refresh_starred(db)?;
             Ok(())
         })();
         self.loading = false;
@@ -254,6 +268,14 @@ impl AppState {
                         })
                         .collect(),
                     "Playlists",
+                );
+            }
+            Tab::Favorites => {
+                let tracks = db.starred_tracks()?;
+                self.ctx_tracks = tracks.iter().map(TrackMeta::from).collect();
+                self.set_list(
+                    tracks.iter().map(items_from_track).collect(),
+                    format!("Favorites ({})", tracks.len()),
                 );
             }
             Tab::Queue => {
@@ -383,6 +405,48 @@ impl AppState {
     pub fn queue_and_play(&self, engine: &mut Engine, tracks: Vec<TrackMeta>, start: usize) {
         engine.set_queue(tracks, start);
     }
+
+    // ---------- favorites ----------
+
+    /// Перезавантажити множину зазірочених id з кешу (для позначки ♥).
+    pub fn refresh_starred(&mut self, db: &Db) -> Result<()> {
+        self.starred_ids = db.starred_ids()?.into_iter().collect();
+        Ok(())
+    }
+
+    /// Перемкнути favorite вибраного треку: server (star/unstar) → кеш →
+    /// оновлення позначок. У вкладці Favorites зазірочений рядок прибирається
+    /// на місці (вибір зберігається); інші вкладки не чіпаємо — сердечки
+    /// малюються з `starred_ids` живцем.
+    /// Повертає `Some(true)`, якщо тепер трек у favorites, `Some(false)` — якщо
+    /// прибрано; `None` — якщо не було вибраного треку.
+    pub fn toggle_favorite(&mut self, client: &Client, db: &mut Db) -> Result<Option<bool>> {
+        let track = match self.selected_track() {
+            Some(t) => t,
+            None => {
+                self.set_message("Favorites: select a track first (f)", true);
+                return Ok(None);
+            }
+        };
+        let now_starred = if self.starred_ids.contains(&track.id) {
+            client.unstar(&track.id)?;
+            db.unstar_track(&track.id)?;
+            false
+        } else {
+            client.star(&track.id)?;
+            db.star_track(&child_from_meta(&track))?;
+            true
+        };
+        self.refresh_starred(db)?;
+        if self.tab == Tab::Favorites && !now_starred {
+            let before = self.selected;
+            self.list.retain(|i| !matches!(i, ListItem::Track(t) if t.id == track.id));
+            self.ctx_tracks.retain(|t| t.id != track.id);
+            self.selected = before.min(self.list.len().saturating_sub(1));
+            self.list_title = format!("Favorites ({})", self.list.len());
+        }
+        Ok(Some(now_starred))
+    }
 }
 
 // ---------- конвертери в ListItem ----------
@@ -410,6 +474,22 @@ fn items_from_cached_album(a: &CachedAlbum) -> ListItem {
 
 fn items_from_track(t: &CachedTrack) -> ListItem {
     ListItem::Track(TrackMeta::from(t))
+}
+
+/// TrackMeta → Child (для збереження favorite у кеші).
+fn child_from_meta(t: &TrackMeta) -> crate::api::models::Child {
+    crate::api::models::Child {
+        id: t.id.clone(),
+        title: Some(t.title.clone()),
+        album: Some(t.album.clone()),
+        album_id: Some(t.album_id.clone()),
+        artist: Some(t.artist.clone()),
+        cover_art: t.cover_art.clone(),
+        duration: Some(t.duration),
+        track: t.track_number,
+        disc_number: t.disc_number,
+        ..Default::default()
+    }
 }
 
 pub fn list_row_style(selected: bool) -> Style {
