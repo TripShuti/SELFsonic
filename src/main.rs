@@ -94,16 +94,6 @@ fn main() -> Result<()> {
     if let Err(e) = app.load_current_tab_from_cache(&mut db) {
         warn!("cache empty/corrupted: {e}");
     }
-    // Favorites синкаються з сервером на старті (далі — тільки ручний `r`,
-    // без polling). Падіння не критичне — старі клієнти просто побачать
-    // порожній список до першого refresh.
-    if let Err(e) = (|| -> Result<()> {
-        let starred = client.get_starred2()?;
-        db.sync_starred(&starred)?;
-        Ok(())
-    })() {
-        warn!("initial starred sync failed: {e}");
-    }
     if let Err(e) = app.refresh_starred(&db) {
         warn!("starred cache read failed: {e}");
     }
@@ -161,11 +151,22 @@ fn parse_args() -> Result<PathBuf> {
 
 fn setup_logging() -> Result<()> {
     let dir = state_dir()?;
-    let file_appender = tracing_appender::rolling::never(&dir, "SELFsonic.log");
+    let file_appender = tracing_appender::rolling::daily(&dir, "SELFsonic.log");
+    // Власні DEBUG-логи лишаються; DEBUG-спам залежностей (ureq, symphonia)
+    // душить — інакше лог росте на ~600KB/день. Перевизначення — через
+    // RUST_LOG (env-filter увімкнений у tracing-subscriber).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "selfsonic=debug,\
+             ureq=warn,ureq_proto=warn,\
+             symphonia_core=warn,symphonia_bundle_mp3=warn,\
+             symphonia_bundle_flac=warn,symphonia_metadata=warn",
+        )
+    });
     tracing_subscriber::fmt()
         .with_writer(file_appender)
         .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(filter)
         .init();
     Ok(())
 }
