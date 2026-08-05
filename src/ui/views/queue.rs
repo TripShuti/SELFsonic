@@ -15,9 +15,20 @@ use super::{fmt_duration, render_list_rows};
 pub fn render(frame: &mut Frame, area: Rect, app: &AppState, engine: &Engine) {
     let current_id = engine.current().map(|t| t.id.clone());
     let starred = &app.starred_ids;
-    render_list_rows(frame, area, &app.list_title, &app.list, app.selected, |item| {
-        queue_row(item, &current_id, starred)
+    let anchor = current_id.as_ref().and_then(|id| {
+        app.list
+            .iter()
+            .position(|item| matches!(item, ListItem::Track(t) if &t.id == id))
     });
+    render_list_rows(
+        frame,
+        area,
+        &app.list_title,
+        &app.list,
+        app.selected,
+        anchor,
+        |item| queue_row(item, &current_id, starred),
+    );
 }
 
 fn queue_row(

@@ -96,7 +96,7 @@ pub fn render_list(
     selected: usize,
     starred: &HashSet<String>,
 ) {
-    render_list_rows(frame, area, title, items, selected, |item| {
+    render_list_rows(frame, area, title, items, selected, None, |item| {
         row_item(item, starred)
     });
 }
@@ -109,6 +109,7 @@ pub fn render_list_rows<F>(
     title: &str,
     items: &[ListItem],
     selected: usize,
+    anchor: Option<usize>,
     build: F,
 ) where
     F: Fn(&ListItem) -> TuiListItem<'static>,
@@ -126,8 +127,23 @@ pub fn render_list_rows<F>(
     // Тримаємо вибір у межах видимої області.
     let visible = area.height.saturating_sub(2) as usize;
     let offset = state.selected().unwrap_or(0);
-    if offset >= visible {
-        *state.offset_mut() = offset.saturating_sub(visible.saturating_sub(1));
+    match anchor.filter(|a| *a < items.len()) {
+        Some(a) => {
+            // Вибір вище поточного — плавний скрол; на самому поточному він
+            // прилипає до першого рядка; нижче — тримається зверху, доки
+            // вибір у вʼюпорті.
+            let sel = offset;
+            *state.offset_mut() = if sel <= a {
+                sel
+            } else {
+                a.max(sel.saturating_sub(visible.saturating_sub(1)))
+            };
+        }
+        None => {
+            if offset >= visible {
+                *state.offset_mut() = offset.saturating_sub(visible.saturating_sub(1));
+            }
+        }
     }
     frame.render_stateful_widget(list, area, &mut state);
 }

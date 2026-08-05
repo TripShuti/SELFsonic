@@ -92,6 +92,8 @@ pub struct AppState {
     /// Pagination of the Albums tab.
     pub albums_offset: usize,
     pub albums_exhausted: bool,
+    /// Queue tab is freshly opened: snap selection onto the current track.
+    queue_just_opened: bool,
 }
 
 impl Default for AppState {
@@ -114,6 +116,7 @@ impl AppState {
             starred_ids: std::collections::HashSet::new(),
             albums_offset: 0,
             albums_exhausted: false,
+            queue_just_opened: false,
         }
     }
 
@@ -280,6 +283,7 @@ impl AppState {
             }
             Tab::Queue => {
                 // Живий список наповнюється з main-циклу (engine.queue()).
+                self.queue_just_opened = true;
                 self.set_list(Vec::new(), "Queue");
             }
         }
@@ -293,9 +297,22 @@ impl AppState {
         self.list_title = format!("Queue ({})", self.list.len());
         if self.list.is_empty() {
             self.selected = 0;
-        } else {
-            self.selected = sel.min(self.list.len() - 1);
+            self.queue_just_opened = false;
+            return;
         }
+        if self.queue_just_opened {
+            self.queue_just_opened = false;
+            if let Some(cur) = engine.current()
+                && let Some(idx) = self
+                    .list
+                    .iter()
+                    .position(|i| matches!(i, ListItem::Track(t) if t.id == cur.id))
+            {
+                self.selected = idx;
+                return;
+            }
+        }
+        self.selected = sel.min(self.list.len() - 1);
     }
 
     pub fn load_albums_from_cache(&mut self, db: &mut Db) -> Result<()> {
