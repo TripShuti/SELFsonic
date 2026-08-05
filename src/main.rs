@@ -236,6 +236,9 @@ fn run_tui(
     let mut terminal = ratatui::init();
     let mut quit = false;
     let mut last_dj_refill: Option<Instant> = None;
+    // Остання намальована секунда позиції: прогрес-бар оновлюємо раз на секунду,
+    // решта перемалювань — подієва (клавіші, події движка, DJ, Resize, повідомлення).
+    let mut last_secs: Option<u64> = None;
 
     let result: Result<()> = (|| {
         while !quit {
@@ -243,9 +246,8 @@ fn run_tui(
             if app.tab == Tab::Queue {
                 app.sync_queue(engine);
             }
-            terminal
-                .draw(|f| draw(f, app, engine))
-                .context("drawing")?;
+
+            let mut dirty = false;
 
             if event::poll(TICK).context("event::poll")? {
                 match event::read().context("event::read")? {
@@ -255,15 +257,17 @@ fn run_tui(
                         } else {
                             quit = true;
                         }
+                        dirty = true;
                     }
-                    Event::Resize(..) => { /* перемалювання наступним tick */ }
+                    Event::Resize(..) => dirty = true,
                     _ => {}
                 }
             }
 
-            drain_mpris_commands(mpris.as_ref(), engine, app, &mut quit);
+            dirty |= drain_mpris_commands(mpris.as_ref(), engine, app, &mut quit);
             for ev in engine.poll_events() {
                 handle_engine_event(mpris.as_ref(), app, ev, pos, engine.position());
+                dirty = true;
             }
             engine.maybe_scrobble();
             refresh_mpris(mpris.as_ref(), engine, client, last_queue_gen, pos);
@@ -279,9 +283,11 @@ fn run_tui(
             if dj_due {
                 last_dj_refill = Some(Instant::now());
                 refill_dj(app, client, engine);
+                dirty = true;
             }
 
             // Авто-підвантаження наступної сторінки альбомів.
+            let was_loading = app.loading;
             if app.tab == Tab::Albums
                 && !app.loading
                 && matches!(app.selected_item(), Some(ui::app::ListItem::More))
@@ -291,6 +297,20 @@ fn run_tui(
                     app.set_message(format!("Pagination: {e}"), true);
                 }
                 app.loading = false;
+            }
+            dirty |= was_loading != app.loading;
+
+            // Прогрес-бар малюємо щонайбільше раз на секунду.
+            let secs = engine.position().as_secs();
+            if last_secs != Some(secs) {
+                last_secs = Some(secs);
+                dirty = true;
+            }
+
+            if dirty {
+                terminal
+                    .draw(|f| draw(f, app, engine))
+                    .context("drawing")?;
             }
         }
         Ok(())
@@ -456,9 +476,11 @@ fn drain_mpris_commands(
     engine: &mut Engine,
     app: &mut AppState,
     quit: &mut bool,
-) {
-    let Some(mpris) = mpris else { return };
+) -> bool {
+    let Some(mpris) = mpris else { return false };
+    let mut handled = false;
     while let Ok(cmd) = mpris.commands().try_recv() {
+        handled = true;
         match cmd {
             PlayerCommand::Play | PlayerCommand::PlayPause => engine.toggle(),
             PlayerCommand::Pause => {
@@ -512,6 +534,7 @@ fn drain_mpris_commands(
         }
         app.clear_message();
     }
+    handled
 }
 
 fn handle_engine_event(
@@ -564,6 +587,9 @@ struct PositionGuard {
     baseline: Duration,
     /// Момент початку перемикання (для запобіжного таймауту).
     switch_started: Instant,
+    /// Id треку, для якого вже опубліковано Metadata (кеш: публікуємо
+    /// тільки при зміні треку, а не щотік).
+    last_meta_id: Option<String>,
 }
 
 impl PositionGuard {
@@ -572,6 +598,7 @@ impl PositionGuard {
             switch_pending: false,
             baseline: Duration::ZERO,
             switch_started: Instant::now(),
+            last_meta_id: None,
         }
     }
 
@@ -644,12 +671,21 @@ fn refresh_mpris(
     let published = pos.next(raw);
     mpris.update(MprisUpdate::Position(Time::from_secs(published.as_secs() as i64)));
 
+    // Metadata публікуємо лише при зміні треку — поля Metadata константні
+    // для трека, кешуємо по id і не будуємо/клонуємо його щотік.
     match engine.current() {
         Some(track) => {
-            let art = track.cover_art.as_deref().map(|c| client.cover_art_url(c));
-            mpris.update(MprisUpdate::Metadata(mpris::build_metadata(track, art)));
+            if pos.last_meta_id.as_deref() != Some(track.id.as_str()) {
+                pos.last_meta_id = Some(track.id.clone());
+                let art = track.cover_art.as_deref().map(|c| client.cover_art_url(c));
+                mpris.update(MprisUpdate::Metadata(mpris::build_metadata(track, art)));
+            }
         }
-        None => mpris.update(MprisUpdate::Metadata(mpris_server::Metadata::new())),
+        None => {
+            if pos.last_meta_id.take().is_some() {
+                mpris.update(MprisUpdate::Metadata(mpris_server::Metadata::new()));
+            }
+        }
     }
 
     if *last_queue_gen != Some(engine.queue_gen()) {

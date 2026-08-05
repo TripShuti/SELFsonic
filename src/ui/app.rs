@@ -94,6 +94,8 @@ pub struct AppState {
     pub albums_exhausted: bool,
     /// Queue tab is freshly opened: snap selection onto the current track.
     queue_just_opened: bool,
+    /// Last seen queue generation (rebuild the Queue list only on real changes).
+    last_queue_gen: Option<usize>,
 }
 
 impl Default for AppState {
@@ -117,6 +119,7 @@ impl AppState {
             albums_offset: 0,
             albums_exhausted: false,
             queue_just_opened: false,
+            last_queue_gen: None,
         }
     }
 
@@ -292,6 +295,12 @@ impl AppState {
 
     /// Живий список черги движка для вкладки Queue (викликається кожен тік).
     pub fn sync_queue(&mut self, engine: &Engine) {
+        let queue_version = engine.queue_gen();
+        if !self.queue_just_opened && self.last_queue_gen == Some(queue_version) {
+            // Черга не змінювалась — список не чіпаємо.
+            return;
+        }
+        self.last_queue_gen = Some(queue_version);
         let sel = self.selected;
         self.list = engine.queue().iter().cloned().map(ListItem::Track).collect();
         self.list_title = format!("Queue ({})", self.list.len());
